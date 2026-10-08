@@ -1,0 +1,29 @@
+[workspace]
+members = ["app", "terminal", "linear", "ui"]
+default-members = ["app"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1"
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
+libc = "0.2"
+portable-pty = "0.9"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+signal-hook = "0.3"
+vt100 = "0.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3.4", default-features = false, features = ["rustls", "json"] }
+url = "2"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.3"
+tempfile = "3"
+
+lineark-sdk = "3.1.0"
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }

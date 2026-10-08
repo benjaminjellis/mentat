@@ -1,0 +1,29 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+sqlx.workspace = true
+ui = { path = "../ui" }
+tokio.workspace = true
+anyhow.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+signal-hook.workspace = true
+terminal = { path = "../terminal" }
+linear = { path = "../linear" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+libc.workspace = true
+toml = "0.8"
+
+[[bin]]
+name = "mentat"
+path = "src/main.rs"
+
+[dev-dependencies]
+portable-pty.workspace = true
