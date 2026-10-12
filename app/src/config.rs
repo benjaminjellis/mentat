@@ -1,7 +1,7 @@
 use std::{env, ffi::OsString, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use crossterm::event::{KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
     cli::Cli,
@@ -10,6 +10,8 @@ use crate::{
 
 #[derive(Clone)]
 pub struct Config {
+    pub workspace: crate::settings::WorkspaceKind,
+    pub workspace_root: PathBuf,
     pub agent: crate::settings::AgentKind,
     pub linear: Option<::linear::Config>,
     pub editor: EditorSettings,
@@ -29,12 +31,10 @@ impl Config {
             .ok()
             .or(settings.linear.client_id)
             .unwrap_or_default();
-        let config_directory = crate::settings::directory()?;
         let linear = if settings.linear.api_key.is_some() || !client_id.trim().is_empty() {
             Some(::linear::Config {
                 client_id,
                 api_key: settings.linear.api_key,
-                directory: config_directory.clone(),
             })
         } else {
             None
@@ -48,6 +48,8 @@ impl Config {
             );
         }
         Ok(Self {
+            workspace: settings.workspace.kind,
+            workspace_root: settings.workspace.directory()?,
             agent: cli.agent.unwrap_or(settings.agent.kind),
             linear,
             command: if cli.editor {
@@ -67,8 +69,9 @@ impl Config {
     }
 
     pub fn is_escape(&self, key: KeyEvent) -> bool {
-        key.modifiers == KeyModifiers::CONTROL
-            && ::terminal::input::encode(key, false) == [self.escape as u8 & 0x1f]
+        (self.escape == 'i' && key.code == KeyCode::Tab && key.modifiers.is_empty())
+            || (key.modifiers == KeyModifiers::CONTROL
+                && ::terminal::input::encode(key, false) == [self.escape as u8 & 0x1f])
     }
 }
 
@@ -80,9 +83,9 @@ pub fn parse_escape(value: &str) -> Result<char> {
     let c = chars.next().unwrap_or_default();
     if chars.next().is_some()
         || !(c.is_ascii_lowercase() || matches!(c, ']' | '\\' | '^' | '_'))
-        || matches!(c, 'i' | 'm')
+        || c == 'm'
     {
-        bail!("Use ctrl-] or a control letter other than i or m for the return shortcut");
+        bail!("Use ctrl-] or a control letter other than m for the return shortcut");
     }
     Ok(c)
 }
@@ -116,8 +119,37 @@ mod tests {
         let config = Config::resolve(cli(Some('x')), toml::from_str(source).unwrap()).unwrap();
         assert_eq!(config.escape, 'x');
         assert!(Config::resolve(cli(Some('h')), Settings::default()).is_err());
-        for invalid in ["ctrl-i", "ctrl-m", "ctrl-", "alt-g", "ctrl-gg"] {
+        for invalid in ["ctrl-m", "ctrl-", "alt-g", "ctrl-gg"] {
             assert!(parse_escape(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn return_shortcut_accepts_ctrl_i_and_its_tab_encoding() {
+        let config = Config::resolve(cli(None), Settings::default()).unwrap();
+        assert_eq!(config.escape, 'i');
+        assert!(config.is_escape(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(config.is_escape(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL)));
+        assert!(!config.is_escape(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)));
+        assert!(!config.is_escape(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
+        assert!(!config.is_escape(KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT)));
+        let config = Config::resolve(cli(Some('g')), Settings::default()).unwrap();
+        assert!(!config.is_escape(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(config.is_escape(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn resolves_workspace_backend() {
+        assert_eq!(
+            Config::resolve(cli(None), Settings::default())
+                .unwrap()
+                .workspace,
+            crate::settings::WorkspaceKind::Jj
+        );
+        let settings = toml::from_str("[workspace]\nkind = 'git'").unwrap();
+        assert_eq!(
+            Config::resolve(cli(None), settings).unwrap().workspace,
+            crate::settings::WorkspaceKind::Git
+        );
     }
 }

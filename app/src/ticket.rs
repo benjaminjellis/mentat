@@ -21,7 +21,7 @@ impl PendingPaste {
     pub fn poll(&self, session: &Session) -> Result<bool> {
         ensure!(
             Instant::now() < self.deadline,
-            "The agent is not ready to accept the ticket. Press c to retry."
+            "The agent is not ready to accept the ticket. Paste the ticket manually when ready."
         );
         let ready = session
             .parser

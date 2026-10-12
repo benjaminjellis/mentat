@@ -4,10 +4,14 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["json"] }
+tracing-appender = "0.2.5"
 getrandom.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 ui = { path = "../ui" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 anyhow.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
@@ -16,7 +20,6 @@ terminal = { path = "../terminal" }
 linear = { path = "../linear" }
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 tempfile.workspace = true
 libc.workspace = true
 toml = "0.8"
