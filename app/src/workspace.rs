@@ -67,10 +67,8 @@ impl Workspaces {
                 .connect_with(options),
         )?;
         runtime.block_on(sqlx::migrate!("./migrations").run(&pool))?;
-        ensure!(
-            workspace_root.is_absolute(),
-            "Workspace root must be absolute"
-        );
+        // Resolve relative roots against the repository, even when launched in a subdirectory.
+        let workspace_root = source.join(workspace_root);
         let repository_name = path_component(
             source
                 .file_name()
@@ -487,6 +485,31 @@ fn jj(directory: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_workspace_root_is_next_to_repository_when_started_in_subdirectory() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        git(temp.path(), &["init", repo.to_str().unwrap()]).unwrap();
+        let nested = repo.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let workspaces = Workspaces::open(
+            &nested,
+            &temp.path().join("state"),
+            &crate::settings::WorkspaceSettings::default()
+                .directory()
+                .unwrap(),
+            WorkspaceKind::Git,
+        )
+        .unwrap();
+        assert_eq!(
+            workspaces.root.canonicalize().unwrap().parent().unwrap(),
+            temp.path()
+                .join("mentat-workspaces")
+                .canonicalize()
+                .unwrap()
+        );
+    }
 
     #[test]
     fn linear_database_is_available_while_the_ui_runtime_is_idle() {

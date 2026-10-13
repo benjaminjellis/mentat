@@ -13,7 +13,7 @@ const TEMPLATE: &str = r#"# Mentat configuration
 
 [workspace]
 kind = "jj" # jj or git
-# root = "~/code/mentat-workspaces"
+# root = "../mentat-workspaces"
 
 [agent]
 kind = "codex" # codex or claude
@@ -24,7 +24,7 @@ kind = "nvim" # nvim, vim, or emacs
 args = []
 
 [keybindings]
-return_to_sidebar = "ctrl-i"
+return_to_sidebar = "ctrl-g"
 pane_navigation = true
 
 [linear]
@@ -66,7 +66,7 @@ impl WorkspaceSettings {
         let root = self
             .root
             .as_deref()
-            .unwrap_or(Path::new("~/code/mentat-workspaces"));
+            .unwrap_or(Path::new("../mentat-workspaces"));
         if root.is_absolute() {
             return Ok(root.to_path_buf());
         }
@@ -76,7 +76,11 @@ impl WorkspaceSettings {
                 .context("Cannot locate the home directory for workspace.root")?
                 .join(relative));
         }
-        bail!("workspace.root must be an absolute path or start with ~/")
+        ensure!(
+            !root.as_os_str().is_empty() && !root.to_string_lossy().starts_with('~'),
+            "workspace.root must not be empty; home paths must start with ~/"
+        );
+        Ok(root.to_path_buf())
     }
 }
 
@@ -161,7 +165,7 @@ pub struct Keybindings {
 impl Default for Keybindings {
     fn default() -> Self {
         Self {
-            return_to_sidebar: "ctrl-i".into(),
+            return_to_sidebar: "ctrl-g".into(),
             pane_navigation: true,
         }
     }
@@ -298,15 +302,19 @@ mod tests {
     }
 
     #[test]
-    fn workspace_root_defaults_expands_home_and_rejects_relative_paths() {
+    fn workspace_root_defaults_to_sibling_and_expands_home() {
         let home = Some(Path::new("/home/test"));
         assert_eq!(
             WorkspaceSettings::default()
                 .resolve_directory(home)
                 .unwrap(),
-            Path::new("/home/test/code/mentat-workspaces")
+            Path::new("../mentat-workspaces")
         );
-        for (root, expected) in [("~/work", "/home/test/work"), ("/disk/work", "/disk/work")] {
+        for (root, expected) in [
+            ("~/work", "/home/test/work"),
+            ("/disk/work", "/disk/work"),
+            ("../work", "../work"),
+        ] {
             let settings: Settings =
                 toml::from_str(&format!("[workspace]\nroot = '{root}'")).unwrap();
             assert_eq!(
@@ -314,16 +322,12 @@ mod tests {
                 Path::new(expected)
             );
         }
-        for root in ["", "relative", "~someone/work"] {
+        for root in ["", "~someone/work"] {
             let settings: Settings =
                 toml::from_str(&format!("[workspace]\nroot = '{root}'")).unwrap();
             assert!(settings.workspace.resolve_directory(home).is_err());
         }
-        assert!(
-            WorkspaceSettings::default()
-                .resolve_directory(None)
-                .is_err()
-        );
+        assert!(WorkspaceSettings::default().resolve_directory(None).is_ok());
     }
 
     #[test]
@@ -390,7 +394,7 @@ mod tests {
         assert!(generated.linear.api_key.is_none());
         assert_eq!(generated.editor.command(), [OsString::from("nvim")]);
         assert!(generated.keybindings.pane_navigation);
-        assert_eq!(generated.keybindings.return_to_sidebar, "ctrl-i");
+        assert_eq!(generated.keybindings.return_to_sidebar, "ctrl-g");
         let path = directory.join("config.toml");
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,

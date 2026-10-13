@@ -125,17 +125,26 @@ mod tests {
     }
 
     #[test]
-    fn return_shortcut_accepts_ctrl_i_and_its_tab_encoding() {
+    fn return_shortcut_defaults_to_ctrl_g_and_preserves_tab() {
         let config = Config::resolve(cli(None), Settings::default()).unwrap();
-        assert_eq!(config.escape, 'i');
+        assert_eq!(config.escape, 'g');
+        assert!(!config.is_escape(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!config.is_escape(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL)));
+        assert!(config.is_escape(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)));
+        assert!(!config.is_escape(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert!(!config.is_escape(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
+        assert!(!config.is_escape(KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT)));
+    }
+
+    #[test]
+    fn explicit_ctrl_i_shortcut_accepts_its_tab_encoding() {
+        let config = Config::resolve(cli(Some('i')), Settings::default()).unwrap();
         assert!(config.is_escape(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
         assert!(config.is_escape(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL)));
         assert!(!config.is_escape(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)));
-        assert!(!config.is_escape(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
-        assert!(!config.is_escape(KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT)));
-        let config = Config::resolve(cli(Some('g')), Settings::default()).unwrap();
-        assert!(!config.is_escape(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
-        assert!(config.is_escape(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)));
     }
 
     #[test]

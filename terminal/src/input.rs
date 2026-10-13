@@ -1,4 +1,7 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+pub use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 pub fn encode(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
     if key.kind == KeyEventKind::Release {
@@ -29,6 +32,7 @@ pub fn encode(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
             }
             return bytes;
         }
+        KeyCode::Enter if shift || ctrl => return format!("\x1b[13;{modifier}u").into_bytes(),
         KeyCode::Enter => "\r".to_owned(),
         KeyCode::Tab => "\t".to_owned(),
         KeyCode::BackTab => "\x1b[Z".to_owned(),
@@ -93,6 +97,65 @@ pub fn encode(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
     bytes
 }
 
+/// Encode a mouse event whose zero-based coordinates are relative to the child.
+pub fn mouse(
+    event: MouseEvent,
+    mode: MouseProtocolMode,
+    encoding: MouseProtocolEncoding,
+) -> Vec<u8> {
+    use MouseEventKind::*;
+    use MouseProtocolMode as Mode;
+    if mode == Mode::None
+        || (mode == Mode::Press && !matches!(event.kind, Down(_)))
+        || (matches!(event.kind, Drag(_)) && !matches!(mode, Mode::ButtonMotion | Mode::AnyMotion))
+        || (event.kind == Moved && mode != Mode::AnyMotion)
+    {
+        return Vec::new();
+    }
+    let button = |button| match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    let release = matches!(event.kind, Up(_));
+    let mut code = match event.kind {
+        Down(b) | Up(b) => button(b),
+        Drag(b) => button(b) + 32,
+        Moved => 35,
+        ScrollUp => 64,
+        ScrollDown => 65,
+        ScrollLeft => 66,
+        ScrollRight => 67,
+    };
+    if release && encoding != MouseProtocolEncoding::Sgr {
+        code = 3;
+    }
+    if mode != Mode::Press {
+        code += 4 * u8::from(event.modifiers.contains(KeyModifiers::SHIFT))
+            + 8 * u8::from(event.modifiers.contains(KeyModifiers::ALT))
+            + 16 * u8::from(event.modifiers.contains(KeyModifiers::CONTROL));
+    }
+    let x = u32::from(event.column) + 1;
+    let y = u32::from(event.row) + 1;
+    match encoding {
+        MouseProtocolEncoding::Sgr => {
+            let suffix = if release { 'm' } else { 'M' };
+            format!("\x1b[<{code};{x};{y}{suffix}").into_bytes()
+        }
+        MouseProtocolEncoding::Default if x <= 223 && y <= 223 => {
+            vec![0x1b, b'[', b'M', code + 32, x as u8 + 32, y as u8 + 32]
+        }
+        MouseProtocolEncoding::Utf8 if x <= 2015 && y <= 2015 => format!(
+            "\x1b[M{}{}{}",
+            char::from(code + 32),
+            char::from_u32(x + 32).unwrap(),
+            char::from_u32(y + 32).unwrap(),
+        )
+        .into_bytes(),
+        _ => Vec::new(),
+    }
+}
+
 pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
         format!("\x1b[200~{text}\x1b[201~").into_bytes()
@@ -104,6 +167,85 @@ pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_respects_tracking_modes_and_encodings() {
+        use MouseProtocolEncoding as Encoding;
+        use MouseProtocolMode as Mode;
+        let mut event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(mouse(event, Mode::None, Encoding::Sgr).is_empty());
+        assert_eq!(
+            mouse(event, Mode::PressRelease, Encoding::Sgr),
+            b"\x1b[<0;5;3M"
+        );
+        assert_eq!(
+            mouse(event, Mode::PressRelease, Encoding::Default),
+            b"\x1b[M %#"
+        );
+        event.kind = MouseEventKind::Up(MouseButton::Left);
+        assert!(mouse(event, Mode::Press, Encoding::Sgr).is_empty());
+        assert_eq!(
+            mouse(event, Mode::PressRelease, Encoding::Sgr),
+            b"\x1b[<0;5;3m"
+        );
+        assert_eq!(
+            mouse(event, Mode::PressRelease, Encoding::Default),
+            b"\x1b[M#%#"
+        );
+        event.kind = MouseEventKind::Drag(MouseButton::Right);
+        event.modifiers = KeyModifiers::CONTROL;
+        assert!(mouse(event, Mode::PressRelease, Encoding::Sgr).is_empty());
+        assert_eq!(
+            mouse(event, Mode::ButtonMotion, Encoding::Sgr),
+            b"\x1b[<50;5;3M"
+        );
+        event.kind = MouseEventKind::Moved;
+        assert!(mouse(event, Mode::ButtonMotion, Encoding::Sgr).is_empty());
+        assert_eq!(
+            mouse(event, Mode::AnyMotion, Encoding::Sgr),
+            b"\x1b[<51;5;3M"
+        );
+        event.kind = MouseEventKind::ScrollDown;
+        event.modifiers = KeyModifiers::NONE;
+        assert_eq!(
+            mouse(event, Mode::PressRelease, Encoding::Sgr),
+            b"\x1b[<65;5;3M"
+        );
+        event.column = 223;
+        assert!(mouse(event, Mode::PressRelease, Encoding::Default).is_empty());
+        assert_eq!(
+            mouse(event, Mode::PressRelease, Encoding::Utf8),
+            "\x1b[Ma\u{100}#".as_bytes()
+        );
+    }
+
+    #[test]
+    fn enter_preserves_modifiers_and_backspace_remains_delete() {
+        for (modifiers, expected) in [
+            (KeyModifiers::NONE, b"\r".as_slice()),
+            (KeyModifiers::SHIFT, b"\x1b[13;2u".as_slice()),
+            (KeyModifiers::CONTROL, b"\x1b[13;5u".as_slice()),
+            (KeyModifiers::ALT, b"\x1b\r".as_slice()),
+            (
+                KeyModifiers::SHIFT | KeyModifiers::ALT,
+                b"\x1b[13;4u".as_slice(),
+            ),
+        ] {
+            assert_eq!(
+                encode(KeyEvent::new(KeyCode::Enter, modifiers), false),
+                expected
+            );
+        }
+        assert_eq!(
+            encode(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), false),
+            b"\x7f"
+        );
+    }
 
     #[test]
     fn keys_follow_child_modes() {

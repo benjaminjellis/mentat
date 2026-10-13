@@ -1,6 +1,6 @@
 mod terminal_view;
 
-pub use terminal_view::TerminalView;
+pub use terminal_view::{TerminalSelection, TerminalView};
 
 pub struct Ticket<'a> {
     pub identifier: &'a str,
@@ -72,7 +72,13 @@ pub fn areas(area: Rect, sidebar_visible: bool) -> Areas {
     }
 }
 
-pub fn draw(frame: &mut Frame, linear: &Tickets<'_>, focused: bool, sidebar_visible: bool) -> Rect {
+pub fn draw(
+    frame: &mut Frame,
+    linear: &Tickets<'_>,
+    root_dir: &str,
+    focused: bool,
+    sidebar_visible: bool,
+) -> Rect {
     let areas = areas(frame.area(), sidebar_visible);
     if !sidebar_visible {
         return areas.content;
@@ -90,6 +96,8 @@ pub fn draw(frame: &mut Frame, linear: &Tickets<'_>, focused: bool, sidebar_visi
             Span::styled("≋", Style::default().fg(Color::Rgb(155, 133, 98))),
             Span::styled("≋", Style::default().fg(Color::Rgb(193, 163, 113))),
             Span::styled("≋", Style::default().fg(Color::Rgb(231, 193, 128))),
+            Span::raw("  "),
+            Span::styled(root_dir, Style::default().fg(TICKET_MUTED)),
         ])),
         areas.header,
     );
@@ -286,6 +294,7 @@ pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool
         heading("NAVIGATION"),
         binding("j/k · ↑/↓".into(), "Select issue".into()),
         binding("b".into(), "Sidebar / full screen".into()),
+        binding("Drag".into(), "Copy output from sidebar focus".into()),
         binding(
             format!("Ctrl-{}", escape.to_ascii_uppercase()),
             "Return to manager".into(),
@@ -294,7 +303,7 @@ pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool
     if pane_navigation {
         lines.push(binding(
             "Ctrl-H / L".into(),
-            "Sidebar / overview or tool".into(),
+            "Pane focus (manager only)".into(),
         ));
     }
     lines.extend([
@@ -577,7 +586,7 @@ mod tests {
         for width in [40, 80] {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal
-                .draw(|frame| help(frame, 'i', "Neovim", true))
+                .draw(|frame| help(frame, 'g', "Neovim", true))
                 .unwrap();
             let buffer = terminal.backend().buffer();
             let text = (0..24)
@@ -596,7 +605,7 @@ mod tests {
                 "Agent · paste if new",
                 "Open issue in Linear",
                 "Sidebar / full screen",
-                "Ctrl-I",
+                "Ctrl-G",
                 "Quit",
                 "Esc / ? close",
             ] {
@@ -624,7 +633,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal
                 .draw(|frame| {
-                    let content = draw(frame, &tickets, true, true);
+                    let content = draw(frame, &tickets, "/home/user/project", true, true);
                     assert_eq!(content.width, if width >= 70 { width - 28 } else { width });
                     draw_details(frame, content, details(&tickets, ""), false, None);
                 })
