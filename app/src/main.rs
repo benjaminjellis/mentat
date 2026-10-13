@@ -4,11 +4,29 @@ mod cli;
 mod codex_session;
 mod config;
 mod linear_state;
+mod logging;
 mod settings;
 mod ticket;
 mod workspace;
 
 fn main() -> anyhow::Result<()> {
+    let _logs = logging::init()?;
+    let span = tracing::info_span!(
+        "run",
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION")
+    );
+    let _entered = span.enter();
+    tracing::info!("Mentat starting");
+    let result = run();
+    if let Err(error) = &result {
+        logging::failure("application", error);
+    }
+    tracing::info!(success = result.is_ok(), "Mentat stopped");
+    result
+}
+
+fn run() -> anyhow::Result<()> {
     let Some(cli) = cli::Cli::parse()? else {
         return Ok(());
     };

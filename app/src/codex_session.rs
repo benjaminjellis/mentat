@@ -17,14 +17,14 @@ use std::{
 
 /// Obtain an ID through the structured API before the interactive CLI starts.
 /// Never infer identity from terminal text, timestamps, or `resume --last`.
-pub fn prepare(config: &mut Config) -> Result<()> {
+pub fn prepare(config: &mut Config, cancel: Arc<AtomicBool>) -> Result<()> {
     if !config.agent_mode {
         return Ok(());
     }
     let explicit = config.resume.clone();
     let id = if let Some(id) = explicit {
         validate_id(&id)?;
-        let mut rpc = Rpc::start(&config.cwd)?;
+        let mut rpc = Rpc::start(&config.cwd, cancel.clone())?;
         let response = rpc.request(
             "thread/read",
             json!({"threadId": id, "includeTurns": false}),
@@ -35,7 +35,7 @@ pub fn prepare(config: &mut Config) -> Result<()> {
         );
         id
     } else {
-        let mut rpc = Rpc::start(&config.cwd)?;
+        let mut rpc = Rpc::start(&config.cwd, cancel.clone())?;
         let response = rpc.request(
             "thread/start",
             json!({"cwd": config.cwd, "ephemeral": false}),
@@ -95,9 +95,9 @@ struct Signals {
 }
 
 impl Signals {
-    fn new() -> Result<Self> {
+    fn new(stop: Arc<AtomicBool>) -> Result<Self> {
         let mut signals = Self {
-            stop: Arc::new(AtomicBool::new(false)),
+            stop,
             ids: Vec::new(),
         };
         for signal in [
@@ -122,8 +122,8 @@ impl Drop for Signals {
 }
 
 impl Rpc {
-    fn start(cwd: &Path) -> Result<Self> {
-        let signals = Signals::new()?;
+    fn start(cwd: &Path, cancel: Arc<AtomicBool>) -> Result<Self> {
+        let signals = Signals::new(cancel)?;
         let mut child = Command::new("codex")
             .args(["app-server", "--listen", "stdio://"])
             .current_dir(cwd)
@@ -173,6 +173,8 @@ impl Rpc {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let started = Instant::now();
+        tracing::debug!(method, "Codex helper request started");
         self.next_id += 1;
         let id = self.next_id;
         self.send(json!({"id": id, "method": method, "params": params}))?;
@@ -197,6 +199,11 @@ impl Rpc {
                 continue;
             }
             if let Some(error) = response.get("error") {
+                tracing::warn!(
+                    method,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Codex helper rejected request"
+                );
                 bail!(
                     "Codex {method} failed: {}",
                     error
@@ -205,6 +212,11 @@ impl Rpc {
                         .unwrap_or("unknown error")
                 );
             }
+            tracing::debug!(
+                method,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Codex helper request finished"
+            );
             return response
                 .get("result")
                 .cloned()

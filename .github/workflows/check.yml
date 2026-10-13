@@ -1,5 +1,10 @@
 name: Rust
-on: [push, pull_request]
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
@@ -15,5 +20,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install jj-cli --version 0.45.1 --locked
       - run: cargo fmt --all --check
+        if: runner.os == 'Linux'
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --locked
+        if: runner.os == 'Linux'
+      - run: cargo test --workspace

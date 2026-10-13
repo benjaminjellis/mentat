@@ -11,6 +11,10 @@ use std::{
 
 const TEMPLATE: &str = r#"# Mentat configuration
 
+[workspace]
+kind = "jj" # jj or git
+# root = "~/code/mentat-workspaces"
+
 [agent]
 kind = "codex" # codex or claude
 
@@ -20,7 +24,7 @@ kind = "nvim" # nvim, vim, or emacs
 args = []
 
 [keybindings]
-return_to_sidebar = "ctrl-g"
+return_to_sidebar = "ctrl-i"
 pane_navigation = true
 
 [linear]
@@ -31,10 +35,49 @@ pane_navigation = true
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
+    pub workspace: WorkspaceSettings,
     pub agent: AgentSettings,
     pub editor: EditorSettings,
     pub keybindings: Keybindings,
     pub linear: LinearSettings,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceKind {
+    #[default]
+    Jj,
+    Git,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkspaceSettings {
+    pub kind: WorkspaceKind,
+    pub root: Option<PathBuf>,
+}
+
+impl WorkspaceSettings {
+    pub fn directory(&self) -> Result<PathBuf> {
+        self.resolve_directory(env::var_os("HOME").map(PathBuf::from).as_deref())
+    }
+
+    fn resolve_directory(&self, home: Option<&Path>) -> Result<PathBuf> {
+        let root = self
+            .root
+            .as_deref()
+            .unwrap_or(Path::new("~/code/mentat-workspaces"));
+        if root.is_absolute() {
+            return Ok(root.to_path_buf());
+        }
+        if let Ok(relative) = root.strip_prefix("~") {
+            return Ok(home
+                .filter(|path| path.is_absolute())
+                .context("Cannot locate the home directory for workspace.root")?
+                .join(relative));
+        }
+        bail!("workspace.root must be an absolute path or start with ~/")
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -118,7 +161,7 @@ pub struct Keybindings {
 impl Default for Keybindings {
     fn default() -> Self {
         Self {
-            return_to_sidebar: "ctrl-g".into(),
+            return_to_sidebar: "ctrl-i".into(),
             pane_navigation: true,
         }
     }
@@ -218,14 +261,18 @@ impl Settings {
         // Expose the provider choice in older files without changing user settings.
         let table: toml::Table = toml::from_str(&source)
             .map_err(|_| anyhow::anyhow!("Invalid configuration in {}", path.display()))?;
+        let mut additions = String::new();
         if !table.contains_key("agent") {
+            additions.push_str("\n[agent]\nkind = \"codex\" # codex or claude\n");
+        }
+        if !table.contains_key("workspace") {
+            additions.push_str("\n[workspace]\nkind = \"jj\" # jj or git\n");
+        }
+        if !additions.is_empty() {
             let mut file = tempfile::NamedTempFile::new_in(directory)?;
             file.as_file()
                 .set_permissions(fs::Permissions::from_mode(0o600))?;
-            write!(
-                file,
-                "{source}\n[agent]\nkind = \"codex\" # codex or claude\n"
-            )?;
+            write!(file, "{source}{additions}")?;
             file.as_file().sync_all()?;
             ensure!(
                 fs::read_to_string(&path)? == source,
@@ -241,6 +288,43 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_backend_defaults_to_jj_and_accepts_git() {
+        assert_eq!(Settings::default().workspace.kind, WorkspaceKind::Jj);
+        let settings: Settings = toml::from_str("[workspace]\nkind = 'git'").unwrap();
+        assert_eq!(settings.workspace.kind, WorkspaceKind::Git);
+        assert!(toml::from_str::<Settings>("[workspace]\nkind = 'svn'").is_err());
+    }
+
+    #[test]
+    fn workspace_root_defaults_expands_home_and_rejects_relative_paths() {
+        let home = Some(Path::new("/home/test"));
+        assert_eq!(
+            WorkspaceSettings::default()
+                .resolve_directory(home)
+                .unwrap(),
+            Path::new("/home/test/code/mentat-workspaces")
+        );
+        for (root, expected) in [("~/work", "/home/test/work"), ("/disk/work", "/disk/work")] {
+            let settings: Settings =
+                toml::from_str(&format!("[workspace]\nroot = '{root}'")).unwrap();
+            assert_eq!(
+                settings.workspace.resolve_directory(home).unwrap(),
+                Path::new(expected)
+            );
+        }
+        for root in ["", "relative", "~someone/work"] {
+            let settings: Settings =
+                toml::from_str(&format!("[workspace]\nroot = '{root}'")).unwrap();
+            assert!(settings.workspace.resolve_directory(home).is_err());
+        }
+        assert!(
+            WorkspaceSettings::default()
+                .resolve_directory(None)
+                .is_err()
+        );
+    }
 
     #[test]
     fn state_paths_follow_xdg() {
@@ -306,7 +390,7 @@ mod tests {
         assert!(generated.linear.api_key.is_none());
         assert_eq!(generated.editor.command(), [OsString::from("nvim")]);
         assert!(generated.keybindings.pane_navigation);
-        assert_eq!(generated.keybindings.return_to_sidebar, "ctrl-g");
+        assert_eq!(generated.keybindings.return_to_sidebar, "ctrl-i");
         let path = directory.join("config.toml");
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -324,6 +408,7 @@ mod tests {
         let updated = fs::read_to_string(&path).unwrap();
         assert!(updated.starts_with(source));
         assert!(updated.contains("[agent]\nkind = \"codex\""));
+        assert!(updated.contains("[workspace]\nkind = \"jj\""));
         Settings::load(&directory).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), updated);
         fs::write(

@@ -1,12 +1,68 @@
 use crate::{codex_session, config::Config, settings::AgentKind};
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
+};
+use std::thread::{self, JoinHandle};
 
-pub fn prepare(config: &mut Config) -> Result<()> {
+pub struct Startup {
+    receiver: Receiver<Result<Config>>,
+    worker: Option<JoinHandle<()>>,
+    cancel: Arc<AtomicBool>,
+    pub paste: Option<linear::Issue>,
+}
+
+impl Startup {
+    pub fn start(mut config: Config, paste: Option<linear::Issue>) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (sender, receiver) = mpsc::channel();
+        let span = tracing::Span::current();
+        let worker = thread::spawn(move || {
+            let _entered = span.enter();
+            let started = std::time::Instant::now();
+            let result = prepare(&mut config, worker_cancel).map(|()| config);
+            tracing::debug!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                success = result.is_ok(),
+                "Agent preparation finished"
+            );
+            let _ = sender.send(result);
+        });
+        Self {
+            receiver,
+            worker: Some(worker),
+            cancel,
+            paste,
+        }
+    }
+
+    pub fn poll(&self) -> Result<Option<Config>> {
+        match self.receiver.try_recv() {
+            Ok(result) => result.map(Some),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(error) => Err(error).context("Agent startup stopped unexpectedly"),
+        }
+    }
+}
+
+impl Drop for Startup {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn prepare(config: &mut Config, cancel: Arc<AtomicBool>) -> Result<()> {
     if !config.agent_mode {
         return Ok(());
     }
     if config.agent == AgentKind::Codex {
-        return codex_session::prepare(config);
+        return codex_session::prepare(config, cancel);
     }
     let (id, resume) = match &config.resume {
         Some(id) if !config.new_conversation => (id.clone(), true),
@@ -59,15 +115,15 @@ mod tests {
             Settings::default(),
         )
         .unwrap();
-        prepare(&mut config).unwrap();
+        prepare(&mut config, Arc::new(AtomicBool::new(false))).unwrap();
         let id = config.resume.clone().unwrap();
         assert_eq!(id.len(), 36);
         assert_eq!(config.command[1], "--session-id");
-        prepare(&mut config).unwrap();
+        prepare(&mut config, Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(config.command[1], "--resume");
         assert_eq!(config.resume.as_deref(), Some(id.as_str()));
         config.new_conversation = true;
-        prepare(&mut config).unwrap();
+        prepare(&mut config, Arc::new(AtomicBool::new(false))).unwrap();
         assert_ne!(config.resume.as_deref(), Some(id.as_str()));
     }
 }

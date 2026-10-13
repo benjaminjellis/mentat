@@ -7,11 +7,6 @@ CREATE TABLE workspaces (
     PRIMARY KEY (repository, ticket_id)
 );
 
-CREATE TABLE app_state (
-    repository TEXT PRIMARY KEY,
-    selected_ticket TEXT
-);
-
 CREATE TABLE agent_sessions (
     repository TEXT NOT NULL,
     ticket_id TEXT NOT NULL,

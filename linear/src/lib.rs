@@ -1,13 +1,13 @@
 mod oauth;
 mod store;
+pub use store::Store;
 
 use anyhow::{Context, Result, bail, ensure};
-use lineark_sdk::Client;
+use lineark_sdk::{Client, LinearError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::future::Future;
 use std::{
-    path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -18,7 +18,12 @@ pub const REDIRECT_URI: &str = "http://127.0.0.1:43821/oauth/callback";
 pub struct Config {
     pub client_id: String,
     pub api_key: Option<String>,
-    pub directory: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Workspace {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -51,16 +56,50 @@ pub enum Progress {
 pub struct SyncResult {
     pub snapshot: Snapshot,
     pub closed: Vec<String>,
+    pub workspace: Workspace,
+}
+
+/// Never format SDK errors: their payloads can contain response bodies and secrets.
+fn log_api_error(operation: &'static str, error: &LinearError) {
+    let (kind, status) = match error {
+        LinearError::Authentication(_) => ("authentication", Some(401)),
+        LinearError::Forbidden(_) => ("forbidden", Some(403)),
+        LinearError::RateLimited { .. } => ("rate_limited", Some(429)),
+        LinearError::HttpError { status, .. } => ("http", Some(*status)),
+        LinearError::Network(error) if error.is_timeout() => ("timeout", None),
+        LinearError::Network(_) => ("network", None),
+        LinearError::GraphQL { .. } => ("graphql", None),
+        LinearError::MissingData(_) => ("missing_data", None),
+        LinearError::InvalidInput(_) => ("invalid_input", None),
+        LinearError::AuthConfig(_) => ("auth_config", None),
+        LinearError::Internal(_) => ("internal", None),
+    };
+    tracing::warn!(
+        operation,
+        error_kind = kind,
+        http_status = status,
+        "Linear API request failed"
+    );
 }
 
 /// Query tracked tickets separately: absence from the assigned list does not mean closed.
+#[tracing::instrument(skip_all)]
 pub async fn sync(
     config: &Config,
+    store: &Store,
     connect: bool,
     tracked: &[String],
     cancel: &AtomicBool,
     progress: impl Fn(Progress),
 ) -> Result<SyncResult> {
+    let started = std::time::Instant::now();
+    tracing::debug!(
+        connect,
+        tracked_count = tracked.len(),
+        "Linear sync started"
+    );
+    store.require_connection(connect).await?;
+    let mut oauth_tokens = None;
     let token = if let Some(api_key) = &config.api_key {
         api_key.clone()
     } else {
@@ -72,21 +111,66 @@ pub async fn sync(
         let mut tokens = if connect {
             oauth::authorize(&agent, config, cancel, &progress)?
         } else {
-            store::load_tokens(config)?
+            store.load_tokens(config).await?
         };
         if tokens.expires_at <= oauth::now() + 60 {
             progress(Progress::Status("Refresh Linear access".into()));
             tokens = oauth::refresh(&agent, config, &tokens)?;
         }
-        store::save_tokens(config, &tokens)?;
-        format!("Bearer {}", tokens.access_token)
+        let token = format!("Bearer {}", tokens.access_token);
+        oauth_tokens = Some(tokens);
+        token
     };
     progress(Progress::Status("Fetch assigned issues".into()));
     let client = Client::from_token(token)?;
+    let workspace = fetch_workspace(&client, cancel).await?;
+    store.bind_workspace(&workspace, connect).await?;
+    // Do not overwrite credentials when reconnecting to the wrong workspace.
+    if let Some(tokens) = oauth_tokens {
+        store.save_tokens(config, &tokens).await?;
+    }
     let snapshot = fetch(&client, cancel).await?;
     let closed = closed_tickets(&client, tracked, cancel).await?;
-    store::save_cache(config, &snapshot)?;
-    Ok(SyncResult { snapshot, closed })
+    store.save_cache(config, &snapshot).await?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        issue_count = snapshot.issues.len(),
+        closed_count = closed.len(),
+        "Linear sync finished"
+    );
+    Ok(SyncResult {
+        snapshot,
+        closed,
+        workspace,
+    })
+}
+
+/// Inspect an API key without changing repository mappings or fetching tickets.
+pub async fn api_key_workspace(config: &Config, cancel: &AtomicBool) -> Result<Workspace> {
+    let key = config
+        .api_key
+        .as_ref()
+        .context("Configure linear.api_key to discover its workspace")?;
+    let client = Client::from_token(key.clone())?;
+    fetch_workspace(&client, cancel).await
+}
+
+#[tracing::instrument(skip_all)]
+async fn fetch_workspace(client: &Client, cancel: &AtomicBool) -> Result<Workspace> {
+    request(cancel, Duration::from_secs(15), async {
+        client
+            .execute(
+                "query MentatWorkspace { organization { id name } }",
+                json!({}),
+                "organization",
+            )
+            .await
+            .map_err(|error| {
+                log_api_error("workspace", &error);
+                anyhow::anyhow!("Cannot identify the Linear workspace; check access and reconnect")
+            })
+    })
+    .await
 }
 
 async fn closed_tickets(
@@ -112,7 +196,10 @@ async fn closed_tickets(
                     "issue",
                 )
                 .await
-                .map_err(|_| anyhow::anyhow!("Cannot verify tracked ticket status"))
+                .map_err(|error| {
+                    log_api_error("ticket_status", &error);
+                    anyhow::anyhow!("Cannot verify tracked ticket status")
+                })
         })
         .await?;
         if matches!(ticket.state.r#type.as_str(), "completed" | "canceled") {
@@ -120,10 +207,6 @@ async fn closed_tickets(
         }
     }
     Ok(closed)
-}
-
-pub fn cached(config: &Config) -> Option<Snapshot> {
-    store::load_cache(config).ok()
 }
 
 async fn fetch(client: &Client, cancel: &AtomicBool) -> Result<Snapshot> {
@@ -135,7 +218,8 @@ async fn fetch(client: &Client, cancel: &AtomicBool) -> Result<Snapshot> {
                 .execute(QUERY, json!({"after": cursor}), "viewer")
                 .await
                 // SDK errors can contain remote response bodies. Keep them out of the UI.
-                .map_err(|_| {
+                .map_err(|error| {
+                    log_api_error("issues", &error);
                     anyhow::anyhow!("Linear request failed; check access and reconnect if needed")
                 })
         })
@@ -208,7 +292,10 @@ async fn request<T>(
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         } => bail!("Linear request cancelled"),
-        result = tokio::time::timeout(timeout, operation) => result.context("Linear request timed out")?,
+        result = tokio::time::timeout(timeout, operation) => {
+            if result.is_err() { tracing::warn!(timeout_ms = timeout.as_millis() as u64, "Linear request timed out"); }
+            result.context("Linear request timed out")?
+        },
     }
 }
 
@@ -226,6 +313,33 @@ mod tests {
                 "url": "https://linear.app/test", "state": {"name": "Todo"}, "team": {"name": "Team"}}],
             "pageInfo": {"hasNextPage": next, "endCursor": id}
         }}}})
+    }
+
+    #[tokio::test]
+    async fn reads_authenticated_workspace_identity() {
+        let server = MockServer::start().await;
+        Mock::given(body_partial_json(
+            json!({"query": "query MentatWorkspace { organization { id name } }"}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"data": {"organization": {"id": "forge-id", "name": "Forge"}}}),
+            ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+        let mut client = Client::from_token("test").unwrap();
+        client.set_base_url(server.uri());
+        assert_eq!(
+            fetch_workspace(&client, &AtomicBool::new(false))
+                .await
+                .unwrap(),
+            Workspace {
+                id: "forge-id".into(),
+                name: "Forge".into()
+            }
+        );
     }
 
     #[tokio::test]
