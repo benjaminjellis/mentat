@@ -194,12 +194,12 @@ fn pane_navigation_focuses_overview_before_any_tool_is_open() {
     wait_focus(0, "startup");
     host.write(b"\x0c").unwrap(); // Ctrl-L, before any ticket session exists.
     wait_focus(28, "ctrl-l");
-    host.write(b"\x08").unwrap(); // Ctrl-H is delivered as Backspace by terminals.
+    host.write(b"\x08").unwrap(); // Legacy Ctrl-H; plain Backspace is 0x7f.
     wait_focus(0, "ctrl-h");
     host.write(b"\x0c").unwrap();
     wait_focus(28, "second ctrl-l");
-    host.write(b"\x09").unwrap(); // Configured return shortcut also leaves overview.
-    wait_focus(0, "ctrl-i");
+    host.write(b"\x07").unwrap(); // Configured return shortcut also leaves overview.
+    wait_focus(0, "ctrl-g");
     quit(&mut host, false);
 }
 
@@ -287,6 +287,256 @@ fn tool_shortcuts_open_interactive_sessions() {
 }
 
 #[test]
+#[ignore = "requires local Neovim"]
+fn neovim_receives_pane_keys_and_mouse_clicks() {
+    let temp = fixture();
+    let script = temp.path().join("editor.vim");
+    let focused = temp.path().join("focused");
+    fs::write(&script, format!(
+        "set mouse=a\nset noswapfile\nfile LEFT-PANE\ncall setline(1, 'LEFT-PANE')\nvsplit\nwincmd l\nenew\nfile RIGHT-PANE\ncall setline(1, 'RIGHT-PANE')\nnnoremap <C-h> <C-w>h\nnnoremap <C-l> <C-w>l\nautocmd WinEnter * call writefile([bufname('%')], '{}')\n",
+        focused.display(),
+    )).unwrap();
+    let config = temp.path().join("mentat/config.toml");
+    let text = fs::read_to_string(&config).unwrap().replace(
+        "executable = '/bin/sh'\nargs = ['-c', 'printf EDITOR-READY; read line']",
+        &format!(
+            "executable = 'nvim'\nargs = ['--clean', '-n', '-i', 'NONE', '-S', '{}']",
+            script.display()
+        ),
+    );
+    fs::write(config, text).unwrap();
+    let mut host = start(&temp);
+    wait_for(&host, "TEST-1");
+    host.write(b"e").unwrap();
+    wait_for(&host, "RIGHT-PANE");
+    let expect_focus = |name: &str| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if fs::read_to_string(&focused).unwrap_or_default().trim() == name {
+                return;
+            }
+            assert!(Instant::now() < deadline, "Neovim did not focus {name}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    host.write(b"\x08").unwrap();
+    expect_focus("LEFT-PANE");
+    host.write(b"\x0c").unwrap();
+    expect_focus("RIGHT-PANE");
+    // Host positions include the 28-column sidebar and one-row header.
+    host.write(b"\x1b[<0;31;3M\x1b[<0;31;3m").unwrap();
+    expect_focus("LEFT-PANE");
+    host.write(b"\x1b[<0;80;3M\x1b[<0;80;3m").unwrap();
+    expect_focus("RIGHT-PANE");
+    // Enhanced keyboard reports must work as well as legacy control bytes.
+    host.write(b"\x1b[104;5u").unwrap();
+    expect_focus("LEFT-PANE");
+    host.write(b"\x1b[108;5u").unwrap();
+    expect_focus("RIGHT-PANE");
+    // Full-screen tools have neither a sidebar nor a header offset.
+    host.write(b"\x07b\x1b[<0;5;2M\x1b[<0;5;2m").unwrap();
+    expect_focus("LEFT-PANE");
+    quit(&mut host, true);
+}
+
+#[test]
+fn dragging_output_copies_only_the_main_pane_and_preserves_paste() {
+    use base64::Engine as _;
+    use std::{
+        io::{Read, Write},
+        sync::{Arc, Mutex},
+    };
+
+    // Retain the raw host output so the clipboard command can be checked without
+    // touching the developer's clipboard or requiring a GUI terminal in CI.
+    struct ChildGuard(Box<dyn portable_pty::Child + Send + Sync>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let temp = fixture();
+    let capture = temp.path().join("agent-input");
+    let pair = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_mentat"));
+    command.cwd(temp.path().join("repo"));
+    command.env("XDG_CONFIG_HOME", temp.path());
+    command.env("XDG_STATE_HOME", temp.path().join("state"));
+    command.env_remove("LINEAR_CLIENT_ID");
+    command.env("TERM", "xterm-256color");
+    command.env("CAPTURE", &capture);
+    command.args(["--", "/bin/sh", "-c", "stty raw -echo; printf '\\033[?1002h\\033[?1006h\\033[?2004h\\033[2J\\033[Halpha\\r\\nbeta'; cat >> \"$CAPTURE\""]);
+    let mut child = ChildGuard(pair.slave.spawn_command(command).unwrap());
+    drop(pair.slave);
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let collected = output.clone();
+    let thread = thread::spawn(move || {
+        let mut buf = [0; 8192];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            collected.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
+    let wait = |predicate: &dyn Fn(&[u8]) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if predicate(&output.lock().unwrap()) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Expected terminal or clipboard output did not arrive"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let screen_contains = |bytes: &[u8], text: &str| {
+        let mut parser =
+            ::terminal::pty::Emulator::new_with_callbacks(30, 100, 0, Default::default());
+        parser.process(bytes);
+        parser.screen().contents().contains(text)
+    };
+    wait(&|bytes| screen_contains(bytes, "TEST-1"));
+    writer.write_all(b"\r").unwrap();
+    wait(&|bytes| screen_contains(bytes, "beta"));
+    writer.write_all(b"\x07").unwrap();
+    // Drag from 'l' in alpha to 't' in beta, accounting for header and sidebar.
+    writer
+        .write_all(b"\x1b[<0;30;2M\x1b[<32;31;3M\x1b[<0;31;3m")
+        .unwrap();
+    let clipboard = format!(
+        "\x1b]52;c;{}\x1b\\",
+        base64::engine::general_purpose::STANDARD.encode("lpha\nbet")
+    );
+    wait(&|bytes| {
+        bytes
+            .windows(clipboard.len())
+            .any(|part| part == clipboard.as_bytes())
+    });
+    assert!(
+        fs::read(&capture).unwrap_or_default().is_empty(),
+        "Selection leaked into the agent"
+    );
+    // A click alone and a drag starting in the header must not copy anything.
+    writer
+        .write_all(b"\x1b[<0;29;2M\x1b[<0;29;2m\x1b[<0;29;1M\x1b[<32;31;3M\x1b[<0;31;3m")
+        .unwrap();
+    // A drag ending over the sidebar is clamped to the main pane.
+    writer
+        .write_all(b"\x1b[<0;29;2M\x1b[<32;1;3M\x1b[<0;1;3m")
+        .unwrap();
+    let clipped = format!(
+        "\x1b]52;c;{}\x1b\\",
+        base64::engine::general_purpose::STANDARD.encode("alpha\nb")
+    );
+    wait(&|bytes| {
+        bytes
+            .windows(clipped.len())
+            .any(|part| part == clipped.as_bytes())
+    });
+    assert_eq!(
+        output
+            .lock()
+            .unwrap()
+            .windows(7)
+            .filter(|part| *part == b"\x1b]52;c;")
+            .count(),
+        2
+    );
+    // Refocus the tool and paste using the terminal's normal bracketed paste.
+    writer.write_all(b"\r\x1b[200~lpha\nbet\x1b[201~").unwrap();
+    wait(&|_| fs::read(&capture).unwrap_or_default() == b"\x1b[200~lpha\nbet\x1b[201~");
+    writer.write_all(b"\x07q").unwrap();
+    wait(&|bytes| screen_contains(bytes, "Force quit"));
+    writer.write_all(b"f").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "Mentat did not exit");
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(writer);
+    drop(pair.master);
+    thread.join().unwrap();
+}
+
+#[test]
+fn sidebar_focus_keeps_tools_visible_and_shortcuts_resume_them() {
+    let temp = fixture();
+    let mut host = start(&temp);
+    wait_for(&host, "TEST-1");
+    let sidebar_color = host
+        .parser
+        .lock()
+        .unwrap()
+        .screen()
+        .cell(1, 0)
+        .unwrap()
+        .fgcolor();
+    let focus_sidebar = |host: &Session, visible: &str| {
+        host.write(b"\x07").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let parser = host.parser.lock().unwrap();
+            let screen = parser.screen();
+            if screen.cell(1, 0).unwrap().fgcolor() == sidebar_color && screen.hide_cursor() {
+                assert!(
+                    screen.contents().contains(visible),
+                    "Tool disappeared while focusing sidebar"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "Sidebar did not gain focus");
+            drop(parser);
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    host.write(b"a").unwrap();
+    host.write(b"printf 'AGENT-%s\\n' VISIBLE\r").unwrap();
+    wait_for(&host, "AGENT-VISIBLE");
+    focus_sidebar(&host, "AGENT-VISIBLE");
+    host.write(b"e").unwrap();
+    wait_for(&host, "EDITOR-READY");
+    focus_sidebar(&host, "EDITOR-READY");
+    host.write(b"t").unwrap();
+    host.write(b"printf 'SHELL-%s\\n' VISIBLE\r").unwrap();
+    wait_for(&host, "SHELL-VISIBLE");
+    focus_sidebar(&host, "SHELL-VISIBLE");
+    // Background output must still redraw while the sidebar has keyboard focus.
+    let marker = temp.path().join("emit-output");
+    host.write(b"t").unwrap();
+    host.write(
+        format!(
+            "while [ ! -f '{}' ]; do sleep 0.02; done; printf 'BACKGROUND-%s\\n' VISIBLE\r",
+            marker.display()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    focus_sidebar(&host, "SHELL-VISIBLE");
+    fs::write(marker, "go").unwrap();
+    wait_for(&host, "BACKGROUND-VISIBLE");
+    host.write(b"a").unwrap();
+    wait_for(&host, "AGENT-VISIBLE");
+    host.write(b"printf 'RESUMED-%s\\n' AGENT\r").unwrap();
+    wait_for(&host, "RESUMED-AGENT");
+    quit(&mut host, true);
+}
+
+#[test]
 fn hiding_sidebar_gives_the_live_terminal_the_whole_screen() {
     let temp = fixture();
     let mut host = start(&temp);
@@ -294,7 +544,7 @@ fn hiding_sidebar_gives_the_live_terminal_the_whole_screen() {
     host.write(b"t").unwrap();
     host.write(b"printf 'BEFORE='; stty size\r").unwrap();
     wait_for(&host, "BEFORE=29 72");
-    host.write(b"\x09b").unwrap();
+    host.write(b"\x07b").unwrap();
     host.write(b"printf 'FULL='; stty size\r").unwrap();
     wait_for(&host, "FULL=30 100");
     assert!(
@@ -306,7 +556,7 @@ fn hiding_sidebar_gives_the_live_terminal_the_whole_screen() {
             .contents()
             .contains("Workspace")
     );
-    host.write(b"\x09bt").unwrap();
+    host.write(b"\x07t").unwrap();
     host.write(b"printf 'RESTORED='; stty size\r").unwrap();
     wait_for(&host, "RESTORED=29 72");
     wait_for(&host, "Workspace");
@@ -314,7 +564,7 @@ fn hiding_sidebar_gives_the_live_terminal_the_whole_screen() {
 }
 
 fn quit(host: &mut Session, force: bool) {
-    host.write(b"\x09q").unwrap();
+    host.write(b"\x07q").unwrap();
     if force {
         wait_for(host, "Force quit");
         host.write(b"f").unwrap();
@@ -429,7 +679,7 @@ fi
             assert!(Instant::now() < deadline, "Spinner did not animate");
             thread::sleep(Duration::from_millis(20));
         }
-        host.write(b"\x09?").unwrap();
+        host.write(b"\x07?").unwrap();
         wait(&host, "Keyboard shortcuts");
         host.write(b"?\x0c").unwrap();
         wait(&host, "Starting codex");
@@ -505,8 +755,19 @@ fn ticket_paste_only_seeds_new_agent_conversations() {
     host.write(b"a").unwrap();
     wait_for(&host, "AGENT-READY");
     expect_input(&expected);
-    host.write(b"\x09aLIVE").unwrap();
+    host.write(b"\x07aLIVE").unwrap();
     expected.extend_from_slice(b"LIVE");
+    expect_input(&expected);
+    // Editing keys must reach the agent without changing focus or losing Shift.
+    host.write(b"\x7f\x1b[127u\x1b[13;2uAFTER\r").unwrap();
+    expected.extend_from_slice(b"\x7f\x7f\x1b[13;2uAFTER\r");
+    expect_input(&expected);
+    // A focused PTY owns shortcuts, including Mentat's pane and manager keys.
+    host.write(b"\x08\x0a\x0b\x0c\x1b[104;5u\x1b[108;5uqbes?\x03")
+        .unwrap();
+    expected.extend_from_slice(b"\x08\x0a\x0b\x0c\x08\x0cqbes?\x03");
+    host.write(b"\x09\x1b[105;5u").unwrap();
+    expected.extend_from_slice(b"\x09\x09");
     expect_input(&expected);
     quit(&mut host, false);
 
@@ -543,9 +804,9 @@ fn ticket_tools_switch_and_restart_without_children() {
     host.write(b"a").unwrap();
     host.write(b"printf 'FIRST-%s\\n' READY\r").unwrap();
     wait_for(&host, "FIRST-READY");
-    host.write(b"\x09e").unwrap();
+    host.write(b"\x07e").unwrap();
     wait_for(&host, "EDITOR-READY");
-    host.write(b"\x09j\r").unwrap();
+    host.write(b"\x07j\r").unwrap();
     host.write(b"printf 'SECOND-%s\\n' READY\r").unwrap();
     wait_for(&host, "SECOND-READY");
     quit(&mut host, true);

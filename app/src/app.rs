@@ -4,11 +4,14 @@ use crate::{
 };
 use ::terminal::{input, pty::Session};
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
 use crossterm::{
     cursor::Show,
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
@@ -34,7 +37,13 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         let guard = Self;
         terminal::enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
         Ok(guard)
     }
 }
@@ -42,6 +51,8 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = execute!(
             io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen,
             Show
@@ -113,6 +124,7 @@ struct App {
     linear: Linear,
     view: View,
     sidebar_visible: bool,
+    selection: Option<ui::TerminalSelection>,
     link_openers: Vec<Child>,
     help: bool,
     status: bool,
@@ -149,6 +161,7 @@ pub fn run(config: Config) -> Result<()> {
         linear,
         view: View::Manager,
         sidebar_visible: true,
+        selection: None,
         link_openers: Vec::new(),
         help: false,
         status: false,
@@ -190,6 +203,24 @@ pub fn run(config: Config) -> Result<()> {
 impl App {
     fn session(&self) -> Option<&TicketSession> {
         self.current.as_ref().and_then(|id| self.sessions.get(id))
+    }
+
+    fn pane_view(&self) -> View {
+        if self.view == View::Manager {
+            self.session()
+                .map_or(View::Overview, |session| session.last)
+        } else {
+            self.view
+        }
+    }
+
+    fn focus_sidebar(&mut self, size: (u16, u16)) -> Result<()> {
+        self.view = View::Manager;
+        if !self.sidebar_visible {
+            self.sidebar_visible = true;
+            self.resize_children(size)?;
+        }
+        Ok(())
     }
 
     fn open_ticket(&mut self, view: View, paste: bool, size: (u16, u16)) -> Result<()> {
@@ -318,6 +349,11 @@ impl App {
         }
         for (id, session) in &mut self.sessions {
             let visible = self.current.as_ref() == Some(id);
+            let pane_view = if self.view == View::Manager {
+                session.last
+            } else {
+                self.view
+            };
             if let Some(startup) = &session.startup {
                 let result = startup.poll().and_then(|config| {
                     let Some(config) = config else {
@@ -388,7 +424,7 @@ impl App {
                         if view == View::Primary {
                             session.starting_at = None;
                         }
-                        if visible && self.view == view {
+                        if visible && pane_view == view {
                             self.view = View::Manager;
                             self.notice = "Terminal exited. Open it again to restart.".into();
                             redraw = true;
@@ -396,7 +432,7 @@ impl App {
                     } else {
                         redraw |= child.changed.swap(false, Ordering::Relaxed)
                             && visible
-                            && self.view == view;
+                            && pane_view == view;
                     }
                 }
             }
@@ -479,6 +515,7 @@ impl App {
             let content = ui::draw(
                 frame,
                 &display,
+                &self.workspaces.source.to_string_lossy(),
                 self.view == View::Manager,
                 self.sidebar_visible,
             );
@@ -487,16 +524,25 @@ impl App {
                     .starting_at
                     .map(|started| (session.config.agent.name(), started.elapsed()))
             });
-            if let Some(child) = self.session().and_then(|s| s.child(self.view))
-                && !(self.view == View::Primary && starting.is_some())
+            let pane_view = self.pane_view();
+            if let Some(child) = self.session().and_then(|s| s.child(pane_view))
+                && !(pane_view == View::Primary && starting.is_some())
             {
                 let parser = child.parser.lock().unwrap_or_else(|e| e.into_inner());
-                ui::draw_terminal(
-                    frame,
-                    content,
-                    parser.screen(),
-                    !self.help && !self.status && !self.quit_prompt && self.linear.picker.is_none(),
-                );
+                if let Some(selection) = &self.selection {
+                    frame.render_widget(selection, content);
+                } else {
+                    ui::draw_terminal(
+                        frame,
+                        content,
+                        parser.screen(),
+                        self.view != View::Manager
+                            && !self.help
+                            && !self.status
+                            && !self.quit_prompt
+                            && self.linear.picker.is_none(),
+                    );
+                }
             } else {
                 ui::draw_details(
                     frame,
@@ -569,6 +615,7 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent, size: (u16, u16)) -> Result<bool> {
+        self.selection = None;
         if self.quit_prompt {
             match key.code {
                 KeyCode::Char('f' | 'F') => return Ok(true),
@@ -596,13 +643,12 @@ impl App {
                 self.help = false;
             }
         } else if self.config.pane_navigation
-            && ((key.modifiers == KeyModifiers::CONTROL
-                && matches!(key.code, KeyCode::Char('h' | 'j' | 'k' | 'l')))
-                // Terminals commonly encode Ctrl-H as the Backspace byte.
-                || (key.code == KeyCode::Backspace && key.modifiers.is_empty()))
+            && matches!(self.view, View::Manager | View::Overview)
+            && key.modifiers == KeyModifiers::CONTROL
+            && matches!(key.code, KeyCode::Char('h' | 'l'))
         {
             match key.code {
-                KeyCode::Char('h') | KeyCode::Backspace => self.view = View::Manager,
+                KeyCode::Char('h') => self.focus_sidebar(size)?,
                 KeyCode::Char('l') => {
                     self.view = self
                         .session()
@@ -613,12 +659,10 @@ impl App {
                 }
                 _ => {}
             }
-        } else if self.view == View::Overview && self.config.is_escape(key) {
-            self.view = View::Manager;
+        } else if self.config.is_escape(key) {
+            self.focus_sidebar(size)?;
         } else if !matches!(self.view, View::Manager | View::Overview) {
-            if self.config.is_escape(key) {
-                self.view = View::Manager;
-            } else if let Some(child) = self.session().and_then(|s| s.child(self.view)) {
+            if let Some(child) = self.session().and_then(|s| s.child(self.view)) {
                 let cursor = child
                     .parser
                     .lock()
@@ -636,11 +680,13 @@ impl App {
                 KeyCode::Char('b') => {
                     self.sidebar_visible = !self.sidebar_visible;
                     self.resize_children(size)?;
-                    if !self.sidebar_visible
-                        && let Some(session) = self.session()
-                        && session.child(session.last).is_some()
-                    {
-                        self.view = session.last;
+                    if !self.sidebar_visible {
+                        self.view = self
+                            .session()
+                            .filter(|session| {
+                                session.child(session.last).is_some() || session.startup.is_some()
+                            })
+                            .map_or(View::Overview, |session| session.last);
                     }
                 }
                 KeyCode::Char('?') => self.help = true,
@@ -695,6 +741,73 @@ impl App {
             }
         }
         Ok(false)
+    }
+
+    fn mouse(&mut self, mut mouse: MouseEvent, size: (u16, u16)) -> Result<Option<String>> {
+        let area = ui::areas(
+            ratatui::layout::Rect::new(0, 0, size.0, size.1),
+            self.sidebar_visible,
+        )
+        .content;
+        let inside = area.contains((mouse.column, mouse.row).into());
+        mouse.column = mouse
+            .column
+            .saturating_sub(area.x)
+            .min(area.width.saturating_sub(1));
+        mouse.row = mouse
+            .row
+            .saturating_sub(area.y)
+            .min(area.height.saturating_sub(1));
+
+        if let Some(selection) = &mut self.selection
+            && selection.dragging
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            )
+        {
+            selection.update(mouse.row, mouse.column);
+            if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+                selection.dragging = false;
+                if selection.moved() {
+                    return Ok(Some(selection.text()));
+                }
+                self.selection = None;
+            }
+            return Ok(None);
+        }
+
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Down(_)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ) {
+            self.selection = None;
+        }
+        if inside && let Some(child) = self.session().and_then(|s| s.child(self.pane_view())) {
+            let parser = child.parser.lock().unwrap_or_else(|e| e.into_inner());
+            let screen = parser.screen();
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && (self.view == View::Manager
+                    || screen.mouse_protocol_mode() == ::terminal::input::MouseProtocolMode::None)
+            {
+                let selection = ui::TerminalSelection::new(screen.clone(), mouse.row, mouse.column);
+                drop(parser);
+                self.selection = Some(selection);
+            } else if self.view != View::Manager {
+                let bytes = input::mouse(
+                    mouse,
+                    screen.mouse_protocol_mode(),
+                    screen.mouse_protocol_encoding(),
+                );
+                drop(parser);
+                child.write(&bytes)?;
+            }
+        }
+        Ok(None)
     }
 
     fn resize_children(&self, size: (u16, u16)) -> Result<()> {
@@ -752,6 +865,7 @@ impl App {
             };
             match event {
                 Event::Resize(cols, rows) => {
+                    self.selection = None;
                     self.resize_children((cols, rows))?;
                 }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -768,12 +882,29 @@ impl App {
                         }
                     }
                 }
+                Event::Mouse(mouse)
+                    if !self.help
+                        && !self.status
+                        && !self.quit_prompt
+                        && self.linear.picker.is_none() =>
+                {
+                    let Some((cols, rows)) = host_io(terminal::size())? else {
+                        return Ok(());
+                    };
+                    if let Some(text) = self.mouse(mouse, (cols, rows))? {
+                        // OSC 52 writes the selection to the host clipboard, including over SSH.
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+                        write!(host.backend_mut(), "\x1b]52;c;{encoded}\x1b\\")?;
+                        host.backend_mut().flush()?;
+                    }
+                }
                 Event::Paste(text)
                     if !self.help
                         && !self.status
                         && !self.quit_prompt
                         && self.linear.picker.is_none() =>
                 {
+                    self.selection = None;
                     if let Some(child) = self.session().and_then(|s| s.child(self.view)) {
                         let bracketed = child
                             .parser
