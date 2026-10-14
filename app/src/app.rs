@@ -32,9 +32,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Wheel step through a child's history, in lines.
-const SCROLL_LINES: usize = 3;
-
 /// A busy child can change far faster than anyone can read. Draw at most this
 /// often, and wait at most this long for the next host event.
 const FRAME: Duration = Duration::from_millis(16);
@@ -66,11 +63,16 @@ struct App {
     view: View,
     sidebar_visible: bool,
     selection: Option<ui::TerminalSelection>,
-    link_openers: Vec<Child>,
+    link_openers: Vec<(String, Child)>,
     help: bool,
     status: bool,
     quit_prompt: bool,
     notice: String,
+    forms: HashMap<String, crate::issue_form::Form>,
+    editing: Option<String>,
+    activity: HashMap<String, Vec<String>>,
+    activity_scroll: usize,
+    overview_scroll: u16,
     next_refresh: Instant,
     next_cleanup: Instant,
 }
@@ -108,6 +110,11 @@ pub fn run(config: Config) -> Result<()> {
         status: false,
         quit_prompt: false,
         notice: String::new(),
+        forms: HashMap::new(),
+        editing: None,
+        activity: HashMap::new(),
+        activity_scroll: 0,
+        overview_scroll: 0,
         next_refresh: Instant::now() + Duration::from_secs(60),
         next_cleanup: Instant::now(),
     };
@@ -203,6 +210,15 @@ impl App {
         }
         self.session_mut(&issue.id).last = view;
         self.view = view;
+        let label = match view {
+            View::Primary => "Agent opened",
+            View::Editor => "Editor opened",
+            View::Shell => "Shell opened",
+            _ => "Ticket opened",
+        };
+        if let Some(id) = self.current.clone() {
+            self.record(id, label.into());
+        }
         self.notice.clear();
         Ok(())
     }
@@ -283,8 +299,13 @@ impl App {
         Ok(())
     }
 
+    fn record(&mut self, id: String, message: String) {
+        record_event(&mut self.activity, id, message);
+    }
+
     fn poll(&mut self) -> Result<bool> {
         let mut redraw = self.linear.poll();
+        redraw |= self.poll_edits();
         redraw |= self.poll_link_openers();
         redraw |= self.poll_linear()?;
         redraw |= self.poll_sessions()?;
@@ -292,18 +313,93 @@ impl App {
         Ok(redraw)
     }
 
+    fn poll_edits(&mut self) -> bool {
+        let mut redraw = false;
+        for (id, result) in std::mem::take(&mut self.linear.edited) {
+            match result {
+                Ok(result) => {
+                    if result.submitted {
+                        self.record(id.clone(), "Saved to Linear.".into());
+                    }
+                    let form = self.forms.entry(id).or_default();
+                    if let Some(details) = result.details {
+                        if let Some(snapshot) = &mut self.linear.snapshot
+                            && let Some(issue) = snapshot
+                                .issues
+                                .iter_mut()
+                                .find(|i| i.id == details.issue.id)
+                        {
+                            *issue = details.issue.clone();
+                        }
+                        form.loaded(details, result.submitted);
+                    } else {
+                        form.busy = false;
+                        if form.posting {
+                            form.comment.clear();
+                        } else {
+                            form.dirty = false;
+                            form.details = None;
+                        }
+                    }
+                    if let Some(warning) = result.warning {
+                        form.message = warning;
+                    }
+
+                    if result.submitted {
+                        self.linear.start(false);
+                    }
+                }
+                Err(error) => {
+                    let form = self.forms.entry(id).or_default();
+                    form.busy = false;
+                    form.message = error;
+                }
+            }
+            redraw = true;
+        }
+        if let Some(id) = self.linear.issue().map(|issue| issue.id.clone())
+            && !self.forms.contains_key(&id)
+        {
+            let mut form = crate::issue_form::Form::default();
+            form.load_pending = self.config.linear.is_some();
+            if !form.load_pending {
+                form.message = "Connect Linear to load comments.".into();
+            }
+            self.forms.insert(id, form);
+            redraw = true;
+        }
+        if !self.linear.busy()
+            && self.linear.picker.is_none()
+            && let Some(id) = self
+                .forms
+                .iter()
+                .find(|(_, form)| form.load_pending)
+                .map(|(id, _)| id.clone())
+        {
+            let started = self.linear.edit(id.clone(), ::linear::EditOperation::Load);
+            let form = self.forms.get_mut(&id).unwrap();
+            form.load_pending = false;
+            form.busy = started;
+            if !started {
+                form.message = "Connect Linear before editing this issue.".into();
+            }
+            redraw = true;
+        }
+        redraw
+    }
+
     /// Report the outcome of the external URL handler once it exits.
     fn poll_link_openers(&mut self) -> bool {
         let mut redraw = false;
-        let notice = &mut self.notice;
-        self.link_openers.retain_mut(|child| match child.try_wait() {
+        self.link_openers.retain_mut(|(id, child)| match child.try_wait() {
             Ok(None) => true,
             result => {
-                *notice = match result {
+                let message = match result {
                     Ok(Some(status)) if status.success() => "Opened issue in Linear.".into(),
                     _ => "Could not open Linear. Check your system's default browser or URL handler."
                         .into(),
                 };
+                record_event(&mut self.activity, id.clone(), message);
                 redraw = true;
                 false
             }
@@ -337,6 +433,7 @@ impl App {
             view: current_view,
             sidebar_visible,
             notice,
+            activity,
             ..
         } = self;
         let mut redraw = false;
@@ -345,10 +442,14 @@ impl App {
             let pane_view = session.pane_view(*current_view);
             match session.advance_startup(id, workspaces, *sidebar_visible) {
                 Ok(false) => {}
-                Ok(true) => redraw = true,
+                Ok(true) => {
+                    record_event(activity, id.clone(), "Agent started.".into());
+                    redraw = true;
+                }
                 Err(error) => {
                     crate::logging::failure("agent_startup", &error);
                     *notice = format!("Agent startup failed: {error:#}");
+                    record_event(activity, id.clone(), notice.clone());
                     if visible {
                         *current_view = View::Manager;
                     }
@@ -360,6 +461,13 @@ impl App {
                 let Some(child) = slot else { continue };
                 if child.poll_exit()? {
                     tracing::info!(ticket_id = %id, "Ticket terminal exited");
+                    let message = match pane {
+                        Pane::Primary => "Agent exited · a to reopen",
+                        Pane::Editor => "Editor exited · e to reopen",
+                        Pane::Shell => "Shell exited · t to reopen",
+                    };
+                    record_event(activity, id.clone(), message.into());
+                    redraw = true;
                     child.shutdown()?;
                     *slot = None;
                     if pane == Pane::Primary {
@@ -379,6 +487,7 @@ impl App {
             if let Err(error) = session.deliver_paste(visible && *current_view == View::Primary) {
                 crate::logging::failure("ticket_paste", &error);
                 *notice = error.to_string();
+                record_event(activity, id.clone(), notice.clone());
                 *current_view = View::Manager;
                 redraw = true;
             }
@@ -399,6 +508,7 @@ impl App {
                 .is_some_and(TicketSession::has_children)
             {
                 self.notice = "Closed ticket workspace retained until its terminals exit.".into();
+                self.record(record.ticket_id.clone(), self.notice.clone());
                 redraw = true;
                 continue;
             }
@@ -417,6 +527,7 @@ impl App {
                     self.notice = format!("Workspace cleanup deferred: {error:#}");
                 }
             }
+            self.record(record.ticket_id.clone(), self.notice.clone());
             redraw = true;
         }
         self.next_cleanup = Instant::now() + Duration::from_secs(5);
@@ -440,6 +551,18 @@ impl App {
                 self.sidebar_visible,
             );
             let cursor_style = self.draw_content(frame, content, &display);
+            let activity_area = ui::areas(frame.area(), self.sidebar_visible).activity;
+            let events = self
+                .editing
+                .as_deref()
+                .or_else(|| self.linear.issue().map(|issue| issue.id.as_str()))
+                .and_then(|id| self.activity.get(id));
+            ui::draw_activity(
+                frame,
+                activity_area,
+                events.map_or(&[], Vec::as_slice),
+                self.activity_scroll,
+            );
             self.draw_overlays(frame);
             cursor_style
         })?;
@@ -476,6 +599,10 @@ impl App {
                 .starting_at
                 .map(|started| (session.config.agent.name(), started.elapsed()))
         });
+        if let Some(form) = self.editing.as_ref().and_then(|id| self.forms.get(id)) {
+            form.draw(frame, content);
+            return SetCursorStyle::DefaultUserShape;
+        }
         let pane_view = self.pane_view();
         // An agent that has not painted yet still shows its startup banner.
         let child = self
@@ -483,12 +610,44 @@ impl App {
             .and_then(|s| s.child(pane_view))
             .filter(|_| !(pane_view == View::Primary && starting.is_some()));
         let Some(child) = child else {
+            let mut text = ui::details(display, &self.notice);
+            if let Some(issue) = self.linear.issue() {
+                let form = self.forms.get(&issue.id);
+                let details = form.and_then(|form| form.details.as_ref());
+                let comments: Vec<_> = details
+                    .map(|details| {
+                        details
+                            .comments
+                            .iter()
+                            .map(|comment| ui::Comment {
+                                author: comment
+                                    .user
+                                    .as_ref()
+                                    .map_or("Unknown", |user| user.name.as_str()),
+                                created_at: &comment.created_at,
+                                body: &comment.body,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let status = if form.is_none_or(|form| form.busy || form.load_pending) {
+                    Some("Loading comments…")
+                } else if details.is_none() {
+                    Some(form.map_or("Comments unavailable · r to retry", |form| {
+                        form.message.as_str()
+                    }))
+                } else {
+                    None
+                };
+                ui::append_comments(&mut text, &comments, status);
+            }
             ui::draw_details(
                 frame,
                 content,
-                ui::details(display, &self.notice),
+                text,
                 self.view == View::Overview,
                 starting,
+                self.overview_scroll,
             );
             return SetCursorStyle::DefaultUserShape;
         };
@@ -583,6 +742,21 @@ impl App {
             self.status = !matches!(key.code, KeyCode::Esc | KeyCode::Char('s'));
         } else if self.help {
             self.help = !matches!(key.code, KeyCode::Esc | KeyCode::Char('?'));
+        } else if let Some(id) = self.editing.clone() {
+            if key.code == KeyCode::Esc || self.config.is_escape(key) {
+                self.editing = None;
+                self.view = View::Overview;
+            } else if let Some(operation) = self.forms.get_mut(&id).and_then(|form| form.key(key)) {
+                let started = self.linear.edit(id.clone(), operation);
+                let form = self.forms.get_mut(&id).unwrap();
+                form.busy = started;
+                form.message = if started {
+                    "Saving…"
+                } else {
+                    "Linear is busy or disconnected. Try again shortly."
+                }
+                .into();
+            }
         } else if let Some(code) = self.pane_navigation_key(key) {
             match code {
                 'h' => self.focus_sidebar(size)?,
@@ -664,7 +838,13 @@ impl App {
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('s') => self.status = true,
             KeyCode::Char('l') => self.linear.open_picker(),
-            KeyCode::Char('r') => self.linear.start(false),
+            KeyCode::Char('r') => {
+                self.linear.start(false);
+                if let Some(id) = self.linear.issue().map(|i| i.id.clone()) {
+                    self.forms.entry(id).or_default().load_pending = true;
+                }
+            }
+
             KeyCode::Char('o') => self.open_in_linear()?,
             KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up => {
                 let step = if matches!(key.code, KeyCode::Char('j') | KeyCode::Down) {
@@ -677,6 +857,32 @@ impl App {
                     self.current = Some(issue.id.clone());
                 }
                 self.notice.clear();
+                self.activity_scroll = 0;
+                self.overview_scroll = 0;
+                if let Some(id) = self.linear.issue().map(|issue| issue.id.clone())
+                    && let Some(form) = self.forms.get_mut(&id)
+                    && !form.busy
+                {
+                    form.load_pending = self.config.linear.is_some();
+                }
+            }
+            KeyCode::PageDown => self.overview_scroll = self.overview_scroll.saturating_add(5),
+            KeyCode::PageUp => self.overview_scroll = self.overview_scroll.saturating_sub(5),
+            KeyCode::Char('i') => {
+                if let Some(id) = self.linear.issue().map(|i| i.id.clone()) {
+                    let started = self.linear.edit(id.clone(), ::linear::EditOperation::Load);
+                    let form = self.forms.entry(id.clone()).or_default();
+                    form.load_pending = !started && !form.busy && self.config.linear.is_some();
+                    form.busy |= started;
+                    form.message = if form.busy || form.load_pending {
+                        "Loading issue…"
+                    } else {
+                        "Connect Linear before editing this issue."
+                    }
+                    .into();
+                    self.editing = Some(id);
+                    self.view = View::Overview;
+                }
             }
             KeyCode::Char('a') => self.open_ticket(View::Primary, false, size)?,
             KeyCode::Enter => self.open_ticket(View::Primary, true, size)?,
@@ -703,12 +909,34 @@ impl App {
                 crate::browser::program()
             )
         })?;
-        self.link_openers.push(child);
-        self.notice = format!("Opening {} in Linear…", issue.identifier);
+        let id = issue.id.clone();
+        let message = format!("Opening {} in Linear…", issue.identifier);
+        self.link_openers.push((id.clone(), child));
+        self.record(id, message);
         Ok(())
     }
 
     fn mouse(&mut self, mut mouse: MouseEvent, size: (u16, u16)) -> Result<MouseOutcome> {
+        let activity = ui::areas(Rect::new(0, 0, size.0, size.1), self.sidebar_visible).activity;
+        if activity.contains((mouse.column, mouse.row).into()) {
+            let before = self.activity_scroll;
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.activity_scroll = self.activity_scroll.saturating_add(1).min(199)
+                }
+                MouseEventKind::ScrollDown => {
+                    self.activity_scroll = self.activity_scroll.saturating_sub(1)
+                }
+                _ => {}
+            }
+            return Ok(MouseOutcome {
+                copied: None,
+                redraw: before != self.activity_scroll,
+            });
+        }
+        if self.editing.is_some() {
+            return Ok(MouseOutcome::default());
+        }
         let area = self.content_area(size);
         let inside = area.contains((mouse.column, mouse.row).into());
         mouse.column = mouse
@@ -754,6 +982,11 @@ impl App {
         }
         if inside && let Some(child) = self.session().and_then(|s| s.child(self.pane_view())) {
             let mut parser = child.parser.lock().unwrap_or_else(|e| e.into_inner());
+            let before = parser.screen().scrollback();
+            if input::scroll_history(parser.screen_mut(), mouse) {
+                outcome.redraw |= parser.screen().scrollback() != before;
+                return Ok(outcome);
+            }
             let screen = parser.screen();
             let mode = screen.mouse_protocol_mode();
             // Agents that never ask for mouse reporting leave the wheel and the
@@ -765,22 +998,6 @@ impl App {
                 let selection = ui::TerminalSelection::new(screen.clone(), mouse.row, mouse.column);
                 drop(parser);
                 self.selection = Some(selection);
-            } else if ours
-                && matches!(
-                    mouse.kind,
-                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                )
-            {
-                // The emulator keeps the history the child scrolled away; show it.
-                let screen = parser.screen_mut();
-                let offset = if mouse.kind == MouseEventKind::ScrollUp {
-                    screen.scrollback().saturating_add(SCROLL_LINES)
-                } else {
-                    screen.scrollback().saturating_sub(SCROLL_LINES)
-                };
-                let before = screen.scrollback();
-                screen.set_scrollback(offset);
-                outcome.redraw |= screen.scrollback() != before;
             } else if self.view != View::Manager {
                 let bytes = input::mouse(mouse, mode, screen.mouse_protocol_encoding());
                 drop(parser);
@@ -859,7 +1076,11 @@ impl App {
                         Ok(false) => {}
                         Err(error) => {
                             crate::logging::failure("ui_action", &error);
-                            self.notice = format!("{error:#}");
+                            if let Some(id) = self.current.clone() {
+                                self.record(id, format!("{error:#}"));
+                            } else {
+                                self.notice = format!("{error:#}");
+                            }
                             self.view = View::Manager;
                         }
                     }
@@ -880,7 +1101,10 @@ impl App {
                 Event::Paste(text) if !self.modal_open() => {
                     redraw = true;
                     self.selection = None;
-                    if let Some(child) = self.session().and_then(|s| s.child(self.view)) {
+                    if let Some(form) = self.editing.as_ref().and_then(|id| self.forms.get_mut(id))
+                    {
+                        form.paste(&text);
+                    } else if let Some(child) = self.session().and_then(|s| s.child(self.view)) {
                         let bracketed = child
                             .parser
                             .lock()
@@ -893,5 +1117,27 @@ impl App {
                 _ => {}
             }
         }
+    }
+}
+
+fn record_event(activity: &mut HashMap<String, Vec<String>>, id: String, message: String) {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        % 86400;
+    let events = activity.entry(id).or_default();
+    if events.last().is_some_and(|event| event.ends_with(&message)) {
+        return;
+    }
+    events.push(format!(
+        "{:02}:{:02}:{:02} UTC  {}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60,
+        message
+    ));
+    if events.len() > 200 {
+        events.remove(0);
     }
 }

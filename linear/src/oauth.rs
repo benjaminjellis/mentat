@@ -47,7 +47,7 @@ fn authorization_url(client_id: &str, verifier: &str, state: &str) -> Url {
         ("response_type", "code"),
         ("client_id", client_id),
         ("redirect_uri", REDIRECT_URI),
-        ("scope", "read"),
+        ("scope", "read,write"),
         ("state", state),
         ("actor", "user"),
         ("code_challenge_method", "S256"),
@@ -183,13 +183,11 @@ pub(crate) fn refresh(agent: &ureq::Agent, config: &Config, tokens: &Tokens) -> 
 }
 
 fn exchange(agent: &ureq::Agent, client_id: &str, form: &[(&str, &str)]) -> Result<Tokens> {
-    let token: TokenResponse = agent
+    let mut response = agent
         .post("https://api.linear.app/oauth/token")
         .send_form(form.iter().copied())
-        .context("Linear token exchange failed; press l to reconnect")?
-        .body_mut()
-        .read_json()
-        .context("Linear returned an invalid token response")?;
+        .map_err(|_| anyhow::anyhow!("Linear token exchange failed; press l to reconnect"))?;
+    let token = decode_token_response(response.body_mut())?;
     ensure!(
         token.token_type.eq_ignore_ascii_case("bearer")
             && !token.access_token.is_empty()
@@ -206,9 +204,28 @@ fn exchange(agent: &ureq::Agent, client_id: &str, form: &[(&str, &str)]) -> Resu
     })
 }
 
+// Serde diagnostics can quote values from credential responses. Do not retain
+// their error chain: callers display anyhow errors with alternate formatting.
+fn decode_token_response(body: &mut ureq::Body) -> Result<TokenResponse> {
+    body.read_json()
+        .map_err(|_| anyhow::anyhow!("Linear returned an invalid token response"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_token_response_never_exposes_response_values() {
+        let mut body = ureq::Body::builder().data(br#"{"access_token":"private-access-value","refresh_token":"private-refresh-value","expires_in":"private-invalid-value","token_type":"bearer"}"#.to_vec());
+        let error = decode_token_response(&mut body)
+            .err()
+            .expect("invalid expiry must fail");
+        assert_eq!(
+            format!("{error:#}"),
+            "Linear returned an invalid token response"
+        );
+        assert_eq!(error.chain().count(), 1);
+    }
     #[test]
     fn pkce_uses_s256_and_callbacks_require_exact_state() {
         let url = authorization_url(

@@ -1,3 +1,5 @@
+mod edit;
+pub use edit::{Details, EditOperation, EditResult, edit};
 mod oauth;
 mod store;
 pub use store::Store;

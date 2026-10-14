@@ -11,6 +11,7 @@ use std::{
 };
 
 enum Update {
+    Edited(String, Box<Result<::linear::EditResult, String>>),
     Status(String),
     Done(Result<SyncResult, String>),
     Discovered(Result<::linear::Workspace, String>),
@@ -25,6 +26,7 @@ pub struct WorkspacePicker {
 }
 
 pub struct Linear {
+    pub edited: Vec<(String, Result<::linear::EditResult, String>)>,
     pub snapshot: Option<Snapshot>,
     pub picker: Option<WorkspacePicker>,
     pub workspace: Option<::linear::Workspace>,
@@ -33,6 +35,8 @@ pub struct Linear {
     /// When the current operation started. `None` means idle; the UI animates
     /// from this instant rather than keeping a frame counter of its own.
     busy_since: Option<Instant>,
+    editing_busy: bool,
+    picker_pending: bool,
     pub tracked: Vec<String>,
     pub closed: Vec<String>,
     config: Option<Config>,
@@ -63,6 +67,7 @@ impl Linear {
         workspace: Option<::linear::Workspace>,
     ) -> Self {
         let mut state = Self {
+            edited: vec![],
             snapshot,
             picker: None,
             workspace,
@@ -71,6 +76,8 @@ impl Linear {
             closed: Vec::new(),
             status: "Linear: not connected".into(),
             busy_since: None,
+            editing_busy: false,
+            picker_pending: false,
             config,
             store,
             receiver: None,
@@ -149,6 +156,21 @@ impl Linear {
         });
     }
 
+    pub fn edit(&mut self, id: String, operation: ::linear::EditOperation) -> bool {
+        if self.busy() || self.picker.is_some() {
+            return false;
+        }
+        let Some(config) = self.config.clone() else {
+            return false;
+        };
+        self.editing_busy = true;
+        self.spawn_worker(move |store, cancel, sender| {
+            let result = blocking(::linear::edit(&config, &store, &id, operation, &cancel));
+            let _ = sender.send(Update::Edited(id, Box::new(result)));
+        });
+        true
+    }
+
     fn stop_worker(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
@@ -157,9 +179,17 @@ impl Linear {
         }
         self.receiver = None;
         self.busy_since = None;
+        self.editing_busy = false;
     }
 
     pub fn open_picker(&mut self) {
+        if self.editing_busy {
+            // Finish the current operation before changing its workspace, but
+            // retain the user's request even during an automatic comment load.
+            self.picker_pending = true;
+            return;
+        }
+        self.picker_pending = false;
         tracing::debug!("Opening Linear workspace picker");
         self.stop_worker();
         let config = self.config.clone();
@@ -266,6 +296,11 @@ impl Linear {
         while let Ok(update) = receiver.try_recv() {
             changed = true;
             match update {
+                Update::Edited(id, result) => {
+                    self.busy_since = None;
+                    self.editing_busy = false;
+                    self.edited.push((id, *result));
+                }
                 Update::Status(message) => self.status = message,
                 Update::Discovered(result) => {
                     self.busy_since = None;
@@ -348,7 +383,9 @@ impl Linear {
         if self.worker.is_some() && self.receiver.is_none() {
             self.receiver = Some(receiver);
         }
-        if refresh {
+        if self.picker_pending && !self.editing_busy {
+            self.open_picker();
+        } else if refresh {
             self.start(false);
         }
         changed
@@ -367,6 +404,69 @@ impl Drop for Linear {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn workspace_picker_waits_for_edit_completion_without_losing_the_request() {
+        let mut state = Linear::new(
+            None,
+            vec![],
+            Store::new(sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap()),
+            None,
+            None,
+        );
+        let (sender, receiver) = mpsc::channel();
+        state.receiver = Some(receiver);
+        state.busy_since = Some(Instant::now());
+        state.editing_busy = true;
+        state.open_picker();
+        assert!(state.picker.is_none());
+        assert!(state.busy());
+        assert!(!state.cancel.load(Ordering::Relaxed));
+        sender
+            .send(Update::Edited(
+                "ticket".into(),
+                Box::new(Err("Failed".into())),
+            ))
+            .unwrap();
+        assert!(state.poll());
+        assert!(state.picker.is_some());
+        assert!(!state.busy());
+        assert!(!state.picker_pending);
+        assert_eq!(state.edited.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn comment_load_completion_and_failure_clear_busy_without_restarting() {
+        let mut state = Linear::new(
+            None,
+            vec![],
+            Store::new(sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap()),
+            None,
+            None,
+        );
+        for result in [
+            Ok(::linear::EditResult {
+                details: None,
+                submitted: false,
+                warning: None,
+            }),
+            Err("Linear request timed out".into()),
+        ] {
+            let (sender, receiver) = mpsc::channel();
+            state.receiver = Some(receiver);
+            state.busy_since = Some(Instant::now());
+            state.editing_busy = true;
+            sender
+                .send(Update::Edited("ticket".into(), Box::new(result)))
+                .unwrap();
+            assert!(state.poll());
+            assert!(!state.busy());
+            assert!(!state.editing_busy);
+            assert_eq!(state.edited.len(), 1);
+            state.edited.clear();
+            assert!(!state.poll());
+            assert!(!state.busy());
+        }
+    }
     #[tokio::test]
     async fn picker_only_saves_after_enter_and_preserves_mapping_on_cancel() {
         let temp = tempfile::tempdir().unwrap();

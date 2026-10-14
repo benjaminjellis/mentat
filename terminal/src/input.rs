@@ -97,6 +97,20 @@ pub fn encode(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
     bytes
 }
 
+/// Scroll local history when the child leaves wheel handling to the terminal.
+pub fn scroll_history(screen: &mut vt100::Screen, event: MouseEvent) -> bool {
+    if screen.mouse_protocol_mode() != MouseProtocolMode::None || screen.alternate_screen() {
+        return false;
+    }
+    let offset = match event.kind {
+        MouseEventKind::ScrollUp => screen.scrollback().saturating_add(3),
+        MouseEventKind::ScrollDown => screen.scrollback().saturating_sub(3),
+        _ => return false,
+    };
+    screen.set_scrollback(offset);
+    true
+}
+
 /// Encode a mouse event whose zero-based coordinates are relative to the child.
 pub fn mouse(
     event: MouseEvent,
@@ -167,6 +181,38 @@ pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_scrolls_history_without_stealing_application_mouse_events() {
+        let mut parser = vt100::Parser::new(3, 20, 100);
+        parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let mut event = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(scroll_history(parser.screen_mut(), event));
+        assert_eq!(parser.screen().scrollback(), 2);
+        assert!(parser.screen().contents().starts_with("one"));
+        event.kind = MouseEventKind::ScrollDown;
+        assert!(scroll_history(parser.screen_mut(), event));
+        assert_eq!(parser.screen().scrollback(), 0);
+        assert!(parser.screen().contents().starts_with("three"));
+        parser.process(b"\x1b[?1000h\x1b[?1006h");
+        event.kind = MouseEventKind::ScrollUp;
+        assert!(!scroll_history(parser.screen_mut(), event));
+        assert_eq!(
+            mouse(
+                event,
+                parser.screen().mouse_protocol_mode(),
+                parser.screen().mouse_protocol_encoding()
+            ),
+            b"\x1b[<64;2;2M"
+        );
+        parser.process(b"\x1b[?1000l\x1b[?1049h");
+        assert!(!scroll_history(parser.screen_mut(), event));
+    }
 
     #[test]
     fn mouse_respects_tracking_modes_and_encodings() {

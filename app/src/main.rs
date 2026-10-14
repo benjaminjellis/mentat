@@ -5,6 +5,7 @@ mod cli;
 mod codex_session;
 mod config;
 mod host;
+mod issue_form;
 mod linear_state;
 mod logging;
 mod session;

@@ -972,3 +972,56 @@ fn closing_the_host_terminal_stops_mentat_and_its_child() {
         "Child survived terminal closure"
     );
 }
+
+#[test]
+fn issue_form_keeps_text_local_and_activity_is_separate() {
+    let temp = fixture();
+    let mut host = start(&temp);
+    wait_for(&host, "Ticket overview");
+    wait_for(&host, "Activity");
+    wait_for(&host, "COMMENTS");
+    {
+        let parser = host.parser.lock().unwrap();
+        let screen = parser.screen();
+        let left = screen.contents_between(22, 0, 29, 28);
+        assert!(
+            left.contains("Activity"),
+            "Activity must be below the left ticket list: {left}"
+        );
+    }
+    host.write(b"i").unwrap();
+    wait_for(&host, "Linear issue");
+    // The fixture has cached tickets but no credentials; failed loading must
+    // leave a usable form, and q must type text instead of quitting.
+    wait_for(&host, "sign in");
+    host.write(b"draftq").unwrap();
+    wait_for(&host, "draftq");
+    // Pane navigation and bracketed paste must stay inside the form.
+    host.write(b"\x0c\x1b[200~ pasted\x1b[201~").unwrap();
+    wait_for(&host, "draftq pasted");
+    host.write(b"\x1b").unwrap();
+    wait_for(&host, "Ticket overview");
+    host.write(b"i").unwrap();
+    wait_for(&host, "draftq pasted");
+    host.write(b"\x1b").unwrap();
+    wait_for(&host, "Ticket overview");
+    host.write(b"t").unwrap();
+    host.write(b"exit\r").unwrap();
+    wait_for(&host, "Shell exited");
+    let screen = host.parser.lock().unwrap().screen().contents();
+    assert!(screen.find("Activity").unwrap() < screen.find("Shell exited").unwrap());
+    host.write(b"j").unwrap();
+    wait_for(&host, "TEST-2");
+    // Wait for the selected ticket's overview, not its always-visible sidebar row.
+    wait_for(&host, "https://linear.app/test/issue/TEST-2");
+    assert!(
+        !host
+            .parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("Shell exited")
+    );
+    quit(&mut host, false);
+}
