@@ -11,8 +11,10 @@ use crate::{
 #[derive(Clone)]
 pub struct Config {
     pub workspace: crate::settings::WorkspaceKind,
-    pub workspace_root: PathBuf,
+    /// `None` uses the default root next to the repository.
+    pub workspace_root: Option<PathBuf>,
     pub agent: crate::settings::AgentKind,
+    pub trust_workspaces: bool,
     pub linear: Option<::linear::Config>,
     pub editor: EditorSettings,
     pub pane_navigation: bool,
@@ -51,6 +53,7 @@ impl Config {
             workspace: settings.workspace.kind,
             workspace_root: settings.workspace.directory()?,
             agent: cli.agent.unwrap_or(settings.agent.kind),
+            trust_workspaces: settings.agent.trust_workspaces,
             linear,
             command: if cli.editor {
                 settings.editor.command()

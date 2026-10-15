@@ -37,7 +37,7 @@ impl Workspaces {
     pub fn open(
         source: &Path,
         state: &Path,
-        workspace_root: &Path,
+        workspace_root: Option<&Path>,
         kind: WorkspaceKind,
     ) -> Result<Self> {
         let source = PathBuf::from(match kind {
@@ -67,17 +67,23 @@ impl Workspaces {
                 .connect_with(options),
         )?;
         runtime.block_on(sqlx::migrate!("./migrations").run(&pool))?;
-        // Resolve relative roots against the repository, even when launched in a subdirectory.
-        let workspace_root = source.join(workspace_root);
-        let repository_name = path_component(
-            source
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("repo"),
-        );
-        let digest = Sha256::digest(repository.as_bytes());
-        let repository_id = format!("{digest:x}");
-        let root = workspace_root.join(format!("{repository_name}-{}", &repository_id[..16]));
+        let root = match workspace_root {
+            // Resolve relative roots against the repository, even when launched in a subdirectory.
+            Some(configured) => source.join(configured),
+            // A root of its own per repository keeps ticket directories named after the ticket.
+            None => {
+                let repository_name = path_component(
+                    source
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("repo"),
+                );
+                source
+                    .parent()
+                    .context("Repository has no parent directory")?
+                    .join(format!("{repository_name}-workspaces"))
+            }
+        };
         // Preserve the lock location for workspaces created by older versions.
         let locks = state.join("workspaces");
         fs::DirBuilder::new()
@@ -146,11 +152,10 @@ impl Workspaces {
         let started = std::time::Instant::now();
         tracing::debug!(ticket_id, backend = ?self.kind, "Opening ticket workspace");
         let ticket_name = path_component(identifier);
-        let path = self.root.join(&ticket_name);
-        let name = format!(
-            "mentat-{}-{ticket_name}",
-            self.root.file_name().unwrap().to_string_lossy()
-        );
+        // Workspace names and branches live in a namespace per repository, so the
+        // ticket alone names them; only the directory can clash with another repository.
+        let name = format!("mentat-{ticket_name}");
+        let path = self.claim(&ticket_name)?;
         self.runtime.block_on(sqlx::query("INSERT INTO workspaces(repository, ticket_id, path, name) VALUES (?, ?, ?, ?) ON CONFLICT(repository, ticket_id) DO NOTHING")
             .bind(&self.repository).bind(ticket_id).bind(path.to_string_lossy().as_ref()).bind(&name).execute(&self.pool))?;
         let record = self
@@ -215,6 +220,27 @@ impl Workspaces {
             "Ticket workspace ready"
         );
         Ok(record)
+    }
+
+    /// A shared workspace root, or the two backends of a colocated repository, can
+    /// want one ticket directory twice. Fall back to a digest of the repository only
+    /// then; the stored record keeps whichever directory a workspace already uses.
+    fn claim(&self, ticket_name: &str) -> Result<PathBuf> {
+        let path = self.root.join(ticket_name);
+        let taken = self.runtime.block_on(
+            sqlx::query("SELECT 1 FROM workspaces WHERE path = ? AND repository <> ? LIMIT 1")
+                .bind(path.to_string_lossy().as_ref())
+                .bind(&self.repository)
+                .fetch_optional(&self.pool),
+        )?;
+        if taken.is_none() && !path.try_exists()? {
+            return Ok(path);
+        }
+        let digest = Sha256::digest(self.repository.as_bytes());
+        let repository_id = format!("{digest:x}");
+        Ok(self
+            .root
+            .join(format!("{ticket_name}-{}", &repository_id[..8])))
     }
 
     pub fn lock(&self, record: &Workspace) -> Result<fs::File> {
@@ -487,27 +513,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn relative_workspace_root_is_next_to_repository_when_started_in_subdirectory() {
+    fn workspace_roots_sit_next_to_the_repository_when_started_in_subdirectory() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         git(temp.path(), &["init", repo.to_str().unwrap()]).unwrap();
         let nested = repo.join("nested");
         fs::create_dir(&nested).unwrap();
+        let state = temp.path().join("state");
+        let default = crate::settings::WorkspaceSettings::default()
+            .directory()
+            .unwrap();
+        assert_eq!(default, None);
+        let workspaces =
+            Workspaces::open(&nested, &state, default.as_deref(), WorkspaceKind::Git).unwrap();
+        assert_eq!(
+            workspaces.root.canonicalize().unwrap(),
+            temp.path().join("repo-workspaces").canonicalize().unwrap()
+        );
+        // A configured relative root follows the repository, not the current directory.
         let workspaces = Workspaces::open(
             &nested,
-            &temp.path().join("state"),
-            &crate::settings::WorkspaceSettings::default()
-                .directory()
-                .unwrap(),
+            &state,
+            Some(Path::new("../checkouts")),
             WorkspaceKind::Git,
         )
         .unwrap();
         assert_eq!(
-            workspaces.root.canonicalize().unwrap().parent().unwrap(),
-            temp.path()
-                .join("mentat-workspaces")
-                .canonicalize()
-                .unwrap()
+            workspaces.root.canonicalize().unwrap(),
+            temp.path().join("checkouts").canonicalize().unwrap()
         );
     }
 
@@ -520,10 +553,11 @@ mod tests {
             &["git", "init", "--no-colocate", repo.to_str().unwrap()],
         )
         .unwrap();
+        let checkouts = temp.path().join("checkouts");
         let workspaces = Workspaces::open(
             &repo,
             &temp.path().join("state"),
-            &temp.path().join("checkouts"),
+            Some(&checkouts),
             WorkspaceKind::Jj,
         )
         .unwrap();
@@ -598,26 +632,19 @@ mod tests {
         .unwrap();
         jj(&repo, &["git", "init", "--colocate"]).unwrap();
         let state = temp.path().join("state");
-        let jj_store = Workspaces::open(
-            &repo,
-            &state,
-            &temp.path().join("checkouts"),
-            WorkspaceKind::Jj,
-        )
-        .unwrap();
-        let git_store = Workspaces::open(
-            &repo,
-            &state,
-            &temp.path().join("checkouts"),
-            WorkspaceKind::Git,
-        )
-        .unwrap();
+        let checkouts = temp.path().join("checkouts");
+        let jj_store =
+            Workspaces::open(&repo, &state, Some(&checkouts), WorkspaceKind::Jj).unwrap();
+        let git_store =
+            Workspaces::open(&repo, &state, Some(&checkouts), WorkspaceKind::Git).unwrap();
         let jj_workspace = jj_store.ensure("one", "TEST-1").unwrap();
         jj_store
             .save_conversation("one", "codex", "jj-session")
             .unwrap();
         let git_workspace = git_store.ensure("one", "TEST-1").unwrap();
+        assert_eq!(jj_workspace.path, checkouts.join("TEST-1"));
         assert_ne!(jj_workspace.path, git_workspace.path);
+        assert_eq!(git_workspace.path.parent().unwrap(), checkouts);
         assert!(git_store.conversation("one", "codex").unwrap().is_none());
         git_store.mark_closed(&["one".into()]).unwrap();
         assert!(!jj_store.list().unwrap()[0].cleanup);
@@ -625,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_workspaces_remain_usable_and_repositories_with_same_name_are_separate() {
+    fn stored_paths_are_reused_and_repositories_sharing_a_root_stay_separate() {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
         let root = temp.path().join("checkouts");
@@ -635,8 +662,8 @@ mod tests {
             &["git", "init", "--no-colocate", repo.to_str().unwrap()],
         )
         .unwrap();
-        let store = Workspaces::open(&repo, &state, &root, WorkspaceKind::Jj).unwrap();
-        let legacy = state.join("workspaces/repo-TEST-1");
+        let store = Workspaces::open(&repo, &state, Some(&root), WorkspaceKind::Jj).unwrap();
+        let stored = state.join("workspaces/repo-TEST-1");
         store
             .runtime
             .block_on(
@@ -645,14 +672,14 @@ mod tests {
                 )
                 .bind(&store.repository)
                 .bind("one")
-                .bind(legacy.to_str().unwrap())
+                .bind(stored.to_str().unwrap())
                 .bind("mentat-repo-TEST-1")
                 .execute(&store.pool),
             )
             .unwrap();
         let record = store.ensure("one", "TEST-1").unwrap();
-        assert_eq!(record.path, legacy);
-        assert_eq!(store.ensure("one", "TEST-1").unwrap().path, legacy);
+        assert_eq!(record.path, stored);
+        assert_eq!(store.ensure("one", "TEST-1").unwrap().path, stored);
         store.mark_closed(&["one".into()]).unwrap();
         assert!(store.cleanup(&store.list().unwrap()[0]).unwrap());
         let first = store.ensure("one", "TEST-1").unwrap();
@@ -663,10 +690,13 @@ mod tests {
             &["git", "init", "--no-colocate", other.to_str().unwrap()],
         )
         .unwrap();
-        let other = Workspaces::open(&other, &state, &root, WorkspaceKind::Jj).unwrap();
+        let other = Workspaces::open(&other, &state, Some(&root), WorkspaceKind::Jj).unwrap();
         let second = other.ensure("one", "TEST-1").unwrap();
+        assert_eq!(first.path, root.join("TEST-1"));
         assert_ne!(first.path, second.path);
-        assert_ne!(first.name, second.name);
+        assert_eq!(second.path.parent().unwrap(), root);
+        // Names only have to be unique inside one repository.
+        assert_eq!(first.name, second.name);
     }
 
     #[test]
@@ -706,13 +736,10 @@ mod tests {
             }
         }
         let state = temp.path().join("state");
-        let store = Workspaces::open(&repo, &state, &temp.path().join("checkouts"), kind).unwrap();
+        let checkouts = temp.path().join("checkouts");
+        let store = Workspaces::open(&repo, &state, Some(&checkouts), kind).unwrap();
         let first = store.ensure("one", "TEST-1").unwrap();
-        assert_eq!(first.path.file_name().unwrap(), "TEST-1");
-        assert_eq!(
-            first.path.parent().unwrap().parent().unwrap(),
-            temp.path().join("checkouts")
-        );
+        assert_eq!(first.path, checkouts.join("TEST-1"));
         let second = store.ensure("two", "TEST-2").unwrap();
         assert_ne!(first.path, second.path);
         assert_eq!(store.ensure("one", "TEST-1").unwrap().path, first.path);
@@ -721,11 +748,11 @@ mod tests {
             .save_conversation("one", "claude", "claude-id")
             .unwrap();
         drop(store);
-        let store =
-            Workspaces::open(&repo, &state, &temp.path().join("new-checkouts"), kind).unwrap();
+        let new_checkouts = temp.path().join("new-checkouts");
+        let store = Workspaces::open(&repo, &state, Some(&new_checkouts), kind).unwrap();
         assert_eq!(store.ensure("one", "TEST-1").unwrap().path, first.path);
         let third = store.ensure("three", "TEST-3").unwrap();
-        assert!(third.path.starts_with(temp.path().join("new-checkouts")));
+        assert_eq!(third.path, new_checkouts.join("TEST-3"));
         assert_eq!(
             store.conversation("one", "codex").unwrap().as_deref(),
             Some("codex-id")
