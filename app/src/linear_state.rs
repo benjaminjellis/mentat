@@ -1,12 +1,13 @@
 use ::linear::{Config, Issue, Progress, Snapshot, Store, SyncResult};
+use std::future::Future;
 use std::{
-    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
+        mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 enum Update {
@@ -29,7 +30,9 @@ pub struct Linear {
     pub workspace: Option<::linear::Workspace>,
     pub selected: usize,
     pub status: String,
-    pub busy: bool,
+    /// When the current operation started. `None` means idle; the UI animates
+    /// from this instant rather than keeping a frame counter of its own.
+    busy_since: Option<Instant>,
     pub tracked: Vec<String>,
     pub closed: Vec<String>,
     config: Option<Config>,
@@ -38,6 +41,17 @@ pub struct Linear {
     worker: Option<JoinHandle<()>>,
     retired_workers: Vec<JoinHandle<()>>,
     cancel: Arc<AtomicBool>,
+}
+
+/// Run one async operation on a runtime of its own. Workers are plain threads,
+/// so each owns its reactor for the lifetime of a single request.
+fn blocking<T>(operation: impl Future<Output = anyhow::Result<T>>) -> Result<T, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| runtime.block_on(operation))
+        .map_err(|error| format!("{error:#}"))
 }
 
 impl Linear {
@@ -56,7 +70,7 @@ impl Linear {
             tracked,
             closed: Vec::new(),
             status: "Linear: not connected".into(),
-            busy: false,
+            busy_since: None,
             config,
             store,
             receiver: None,
@@ -81,6 +95,15 @@ impl Linear {
         self.snapshot.as_ref()?.issues.get(self.selected)
     }
 
+    pub fn busy(&self) -> bool {
+        self.busy_since.is_some()
+    }
+
+    /// Elapsed time in the current operation, or `None` when idle.
+    pub fn busy_elapsed(&self) -> Option<std::time::Duration> {
+        self.busy_since.map(|started| started.elapsed())
+    }
+
     pub fn select(&mut self, step: isize) {
         let count = self
             .snapshot
@@ -92,21 +115,13 @@ impl Linear {
     }
 
     pub fn start(&mut self, connect: bool) {
-        if self.busy || self.picker.is_some() {
+        if self.busy() || self.picker.is_some() {
             return;
         }
         let Some(config) = self.config.clone() else {
             self.status = "Set linear.api_key in config".into();
             return;
         };
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-        self.cancel = Arc::new(AtomicBool::new(false));
-        let cancel = self.cancel.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.receiver = Some(receiver);
-        self.busy = true;
         self.status = if connect {
             "Linear: open browser sign-in"
         } else {
@@ -114,53 +129,24 @@ impl Linear {
         }
         .into();
         let tracked = self.tracked.clone();
-        let store = self.store.clone();
-        let span = tracing::Span::current();
-        self.worker = Some(thread::spawn(move || {
-            let _entered = span.enter();
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(anyhow::Error::from)
-                .and_then(|runtime| {
-                    runtime.block_on(::linear::sync(
-                        &config,
-                        &store,
-                        connect,
-                        &tracked,
-                        &cancel,
-                        |progress| {
-                            let status = match progress {
-                                Progress::Status(message) => message,
-                                Progress::Browser(url) => {
-                                    let opener = if cfg!(target_os = "macos") {
-                                        "open"
-                                    } else {
-                                        "xdg-open"
-                                    };
-                                    match Command::new(opener)
-                                        .arg(&url)
-                                        .stdin(Stdio::null())
-                                        .stdout(Stdio::null())
-                                        .stderr(Stdio::null())
-                                        .status()
-                                    {
-                                        Ok(exit) if exit.success() => {
-                                            "Complete Linear sign-in in your browser".into()
-                                        }
-                                        _ => {
-                                            format!("Open this sign-in URL in your browser: {url}")
-                                        }
-                                    }
-                                }
-                            };
-                            let _ = sender.send(Update::Status(status));
-                        },
-                    ))
-                })
-                .map_err(|error| format!("{error:#}"));
+        self.spawn_worker(move |store, cancel, sender| {
+            let progress = |progress| {
+                let status = match progress {
+                    Progress::Status(message) => message,
+                    Progress::Browser(url) => match crate::browser::open(&url).status() {
+                        Ok(exit) if exit.success() => {
+                            "Complete Linear sign-in in your browser".into()
+                        }
+                        _ => format!("Open this sign-in URL in your browser: {url}"),
+                    },
+                };
+                let _ = sender.send(Update::Status(status));
+            };
+            let result = blocking(::linear::sync(
+                &config, &store, connect, &tracked, &cancel, progress,
+            ));
             let _ = sender.send(Update::Done(result));
-        }));
+        });
     }
 
     fn stop_worker(&mut self) {
@@ -170,7 +156,7 @@ impl Linear {
             self.retired_workers.push(worker);
         }
         self.receiver = None;
-        self.busy = false;
+        self.busy_since = None;
     }
 
     pub fn open_picker(&mut self) {
@@ -195,34 +181,31 @@ impl Linear {
             return;
         }
         let config = config.unwrap();
-        self.launch_picker(move |_store, cancel| {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(anyhow::Error::from)
-                .and_then(|runtime| runtime.block_on(::linear::api_key_workspace(&config, &cancel)))
-                .map_err(|error| format!("{error:#}"));
-            Update::Discovered(result)
+        self.spawn_worker(move |_store, cancel, sender| {
+            let result = blocking(::linear::api_key_workspace(&config, &cancel));
+            let _ = sender.send(Update::Discovered(result));
         });
     }
 
-    fn launch_picker(
+    /// Run one Linear operation off the UI thread. Any worker still running is
+    /// joined first, so only the newest one can report into the fresh channel.
+    fn spawn_worker(
         &mut self,
-        operation: impl FnOnce(Store, Arc<AtomicBool>) -> Update + Send + 'static,
+        operation: impl FnOnce(Store, Arc<AtomicBool>, Sender<Update>) + Send + 'static,
     ) {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.cancel = cancel.clone();
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.cancel.clone();
         let store = self.store.clone();
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
-        self.busy = true;
+        self.busy_since = Some(Instant::now());
         let span = tracing::Span::current();
         self.worker = Some(thread::spawn(move || {
             let _entered = span.enter();
-            let _ = sender.send(operation(store, cancel));
+            operation(store, cancel, sender);
         }));
     }
 
@@ -237,7 +220,7 @@ impl Linear {
     }
 
     pub fn confirm_workspace(&mut self) {
-        if self.busy {
+        if self.busy() {
             return;
         }
         let Some(picker) = &mut self.picker else {
@@ -255,15 +238,12 @@ impl Linear {
         };
         picker.saving = true;
         picker.message = "Saving workspace…".into();
-        self.launch_picker(move |store, _cancel| {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(anyhow::Error::from)
-                .and_then(|runtime| runtime.block_on(store.bind_workspace(&workspace, true)))
-                .map(|()| workspace)
-                .map_err(|error| format!("{error:#}"));
-            Update::Mapped(result)
+        self.spawn_worker(move |store, _cancel, sender| {
+            let result = blocking(async {
+                store.bind_workspace(&workspace, true).await?;
+                Ok(workspace)
+            });
+            let _ = sender.send(Update::Mapped(result));
         });
     }
 
@@ -277,17 +257,18 @@ impl Linear {
             }
         }
         let mut changed = false;
-        let Some(receiver) = &self.receiver else {
+        // Take the channel so the loop can mutate `self`; nothing inside replaces
+        // it, because a refresh is deferred until after the drain.
+        let Some(receiver) = self.receiver.take() else {
             return false;
         };
-        let updates: Vec<_> = receiver.try_iter().collect();
         let mut refresh = false;
-        for update in updates {
+        while let Ok(update) = receiver.try_recv() {
             changed = true;
             match update {
                 Update::Status(message) => self.status = message,
                 Update::Discovered(result) => {
-                    self.busy = false;
+                    self.busy_since = None;
                     if let Some(picker) = &mut self.picker {
                         match result {
                             Ok(workspace) => {
@@ -306,7 +287,7 @@ impl Linear {
                     }
                 }
                 Update::Mapped(result) => {
-                    self.busy = false;
+                    self.busy_since = None;
                     match result {
                         Ok(workspace) => {
                             self.workspace = Some(workspace);
@@ -326,7 +307,7 @@ impl Linear {
                     }
                 }
                 Update::Done(result) => {
-                    self.busy = false;
+                    self.busy_since = None;
                     match result {
                         Ok(result) => {
                             self.workspace = Some(result.workspace.clone());
@@ -361,6 +342,11 @@ impl Linear {
                     }
                 }
             }
+        }
+        // The channel belongs to its worker: put it back only while that worker is
+        // still the current one and nothing has installed a replacement channel.
+        if self.worker.is_some() && self.receiver.is_none() {
+            self.receiver = Some(receiver);
         }
         if refresh {
             self.start(false);
@@ -402,7 +388,7 @@ mod tests {
         state.open_picker();
         let (sender, receiver) = mpsc::channel();
         state.receiver = Some(receiver);
-        state.busy = true;
+        state.busy_since = Some(Instant::now());
         sender
             .send(Update::Discovered(Ok(workspace.clone())))
             .unwrap();
@@ -424,7 +410,7 @@ mod tests {
         state.confirm_workspace();
         assert!(state.picker.as_ref().unwrap().saving);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while state.busy {
+        while state.busy() {
             assert!(std::time::Instant::now() < deadline);
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             state.poll();
@@ -446,14 +432,14 @@ mod tests {
         state.open_picker();
         let (sender, receiver) = mpsc::channel();
         state.receiver = Some(receiver);
-        state.busy = true;
+        state.busy_since = Some(Instant::now());
         sender
             .send(Update::Discovered(Err(
                 "Cannot identify the Linear workspace".into(),
             )))
             .unwrap();
         state.poll();
-        assert!(!state.busy);
+        assert!(!state.busy());
         assert!(state.workspace.is_none());
         let picker = state.picker.as_ref().unwrap();
         assert!(picker.available.is_none());
@@ -475,10 +461,10 @@ mod tests {
         });
         let (sender, receiver) = mpsc::channel();
         state.receiver = Some(receiver);
-        state.busy = true;
+        state.busy_since = Some(Instant::now());
         sender.send(Update::Done(Err("Failed".into()))).unwrap();
         assert!(state.poll());
-        assert!(!state.busy);
+        assert!(!state.busy());
         assert_eq!(state.snapshot.as_ref().unwrap().viewer, "Cached");
         assert!(state.status.contains("Cached issues remain available"));
     }

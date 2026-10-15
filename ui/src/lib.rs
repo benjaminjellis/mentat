@@ -2,6 +2,15 @@ mod terminal_view;
 
 pub use terminal_view::{TerminalSelection, TerminalView};
 
+use ratatui::{
+    Frame,
+    layout::{Constraint, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
+};
+use std::time::Duration;
+
 pub struct Ticket<'a> {
     pub identifier: &'a str,
     pub title: &'a str,
@@ -15,28 +24,47 @@ pub struct Tickets<'a> {
     pub items: &'a [Ticket<'a>],
     pub selected: usize,
     pub connected: bool,
-    pub busy: bool,
+    /// Elapsed time in the current Linear operation, which also drives the spinner.
+    pub busy: Option<Duration>,
 }
 
-impl Tickets<'_> {
-    fn issue(&self) -> Option<&Ticket<'_>> {
+impl<'a> Tickets<'a> {
+    fn issue(&self) -> Option<&'a Ticket<'a>> {
         self.items.get(self.selected)
     }
 }
-
-use ratatui::{
-    Frame,
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
-};
 
 const TICKET_ACCENT: Color = Color::Rgb(193, 163, 113);
 const TICKET_TEXT: Color = Color::Rgb(224, 215, 198);
 const TICKET_MUTED: Color = Color::Rgb(145, 143, 133);
 const TICKET_STATUS: Color = Color::Rgb(161, 182, 151);
 const TICKET_SELECTED: Color = Color::Rgb(57, 53, 45);
+
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The caller owns the clock, so a hidden frame counter cannot desynchronise views.
+fn spinner(elapsed: Duration) -> char {
+    SPINNER[(elapsed.as_millis() / 100) as usize % SPINNER.len()]
+}
+
+/// Centre a popup over the whole frame and clear whatever it covers. `Length`
+/// clamps to the available area, so popups stay inside tiny terminals.
+fn popup(frame: &mut Frame, width: u16, height: u16) -> Rect {
+    let area = frame
+        .area()
+        .centered(Constraint::Length(width), Constraint::Length(height));
+    frame.render_widget(Clear, area);
+    area
+}
+
+fn heading(label: &str) -> Line<'_> {
+    Line::from(Span::styled(
+        label,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
 
 pub struct Areas {
     pub sidebar: Rect,
@@ -52,11 +80,7 @@ pub fn areas(area: Rect, sidebar_visible: bool) -> Areas {
             header: Rect::default(),
         };
     }
-    let sidebar_width = if sidebar_visible && area.width >= 70 {
-        28
-    } else {
-        0
-    };
+    let sidebar_width = if area.width >= 70 { 28 } else { 0 };
     let header_height = area.height.min(1);
     let height = area.height.saturating_sub(header_height);
     let content_y = area.y + header_height;
@@ -102,18 +126,9 @@ pub fn draw(
         areas.header,
     );
     if areas.sidebar.width > 0 {
-        let refresh_title = if linear.busy {
-            const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let tick = START
-                .get_or_init(std::time::Instant::now)
-                .elapsed()
-                .as_millis()
-                / 100;
-            format!(" {} ", SPINNER[tick as usize % SPINNER.len()])
-        } else {
-            String::new()
-        };
+        let refresh_title = linear
+            .busy
+            .map_or_else(String::new, |elapsed| format!(" {} ", spinner(elapsed)));
         let block = Block::bordered()
             .title(" Workspace ")
             .title(Line::from(refresh_title).right_aligned())
@@ -160,18 +175,18 @@ pub fn draw(
     areas.content
 }
 
-pub fn details(linear: &Tickets<'_>, notice: &str) -> Text<'static> {
+pub fn details<'a>(linear: &Tickets<'a>, notice: &'a str) -> Text<'a> {
     let muted = Style::default().fg(TICKET_MUTED);
     let mut text = if let Some(issue) = linear.issue() {
         let mut lines = vec![
             Line::from(Span::styled(
-                issue.identifier.to_owned(),
+                issue.identifier,
                 Style::default()
                     .fg(TICKET_ACCENT)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                issue.title.to_owned(),
+                issue.title,
                 Style::default()
                     .fg(TICKET_TEXT)
                     .add_modifier(Modifier::BOLD),
@@ -179,14 +194,14 @@ pub fn details(linear: &Tickets<'_>, notice: &str) -> Text<'static> {
             Line::default(),
             Line::from(vec![
                 Span::styled("Status  ", muted),
-                Span::styled(issue.status.to_owned(), Style::default().fg(TICKET_STATUS)),
+                Span::styled(issue.status, Style::default().fg(TICKET_STATUS)),
             ]),
             Line::from(vec![
                 Span::styled("Team    ", muted),
-                Span::styled(issue.team.to_owned(), Style::default().fg(TICKET_TEXT)),
+                Span::styled(issue.team, Style::default().fg(TICKET_TEXT)),
             ]),
             Line::from(Span::styled(
-                issue.url.to_owned(),
+                issue.url,
                 Style::default()
                     .fg(Color::Rgb(151, 169, 177))
                     .add_modifier(Modifier::UNDERLINED),
@@ -194,23 +209,19 @@ pub fn details(linear: &Tickets<'_>, notice: &str) -> Text<'static> {
             Line::default(),
         ];
         let description = issue.description.filter(|s| !s.trim().is_empty());
+        let style = if description.is_some() {
+            Style::default().fg(TICKET_TEXT)
+        } else {
+            muted
+        };
         lines.extend(
             description
                 .unwrap_or("No description.")
                 .lines()
-                .map(|line| {
-                    Line::from(Span::styled(
-                        line.to_owned(),
-                        if description.is_some() {
-                            Style::default().fg(TICKET_TEXT)
-                        } else {
-                            muted
-                        },
-                    ))
-                }),
+                .map(|line| Line::from(Span::styled(line, style))),
         );
         Text::from(lines)
-    } else if linear.busy {
+    } else if linear.busy.is_some() {
         Text::styled("Loading Linear issues…", muted)
     } else if linear.connected {
         Text::styled(
@@ -222,12 +233,11 @@ pub fn details(linear: &Tickets<'_>, notice: &str) -> Text<'static> {
     };
     if !notice.is_empty() {
         text.lines.push(Line::default());
-        text.lines.extend(notice.lines().map(|line| {
-            Line::from(Span::styled(
-                line.to_owned(),
-                Style::default().fg(TICKET_ACCENT),
-            ))
-        }));
+        text.lines.extend(
+            notice
+                .lines()
+                .map(|line| Line::from(Span::styled(line, Style::default().fg(TICKET_ACCENT)))),
+        );
     }
     text
 }
@@ -237,12 +247,10 @@ pub fn draw_details(
     area: Rect,
     text: Text<'_>,
     focused: bool,
-    starting: Option<(&str, std::time::Duration)>,
+    starting: Option<(&str, Duration)>,
 ) {
     let startup_title = starting.map_or_else(String::new, |(agent, elapsed)| {
-        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        let spinner = FRAMES[(elapsed.as_millis() / 100) as usize % FRAMES.len()];
-        format!(" Starting {agent}… {spinner} ")
+        format!(" Starting {agent}… {} ", spinner(elapsed))
     });
     frame.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
@@ -269,14 +277,6 @@ pub fn draw_details(
 }
 
 pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool) {
-    let heading = |label: &str| {
-        Line::from(Span::styled(
-            format!("  {label}"),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ))
-    };
     let binding = |key: String, action: String| {
         Line::from(vec![
             Span::styled(format!("  {key:<12}"), Style::default().fg(Color::Cyan)),
@@ -284,14 +284,14 @@ pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool
         ])
     };
     let mut lines = vec![
-        heading("TICKET"),
+        heading("  TICKET"),
         binding("a".into(), "Agent".into()),
         binding("Enter".into(), "Agent · send ticket".into()),
         binding("e".into(), format!("Open {editor}")),
         binding("t".into(), "Open shell".into()),
         binding("o".into(), "Open issue in Linear".into()),
         Line::default(),
-        heading("NAVIGATION"),
+        heading("  NAVIGATION"),
         binding("j/k · ↑/↓".into(), "Select issue".into()),
         binding("f".into(), "Sidebar / full screen".into()),
         binding("Drag".into(), "Copy output from sidebar focus".into()),
@@ -308,22 +308,13 @@ pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool
     }
     lines.extend([
         Line::default(),
-        heading("LINEAR & APP"),
+        heading("  LINEAR & APP"),
         binding("l".into(), "Choose Linear workspace".into()),
         binding("r".into(), "Refresh issues".into()),
         binding("s".into(), "Show status".into()),
         binding("q / Ctrl-C".into(), "Quit".into()),
     ]);
-    let area = frame.area();
-    let width = area.width.min(54);
-    let height = area.height.min(lines.len() as u16 + 2);
-    let popup = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
-    frame.render_widget(Clear, popup);
+    let area = popup(frame, 54, lines.len() as u16 + 2);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
@@ -331,7 +322,7 @@ pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool
                 .title_bottom(" Esc / ? close ")
                 .border_style(Style::default().fg(Color::DarkGray)),
         ),
-        popup,
+        area,
     );
 }
 
@@ -346,27 +337,10 @@ pub struct WorkspacePicker<'a> {
 }
 
 pub fn workspace_picker(frame: &mut Frame, picker: WorkspacePicker<'_>) {
-    let area = frame.area();
-    let width = area.width.min(66);
-    let height = area.height.min(19);
-    let popup = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
     let muted = Style::default().fg(Color::DarkGray);
-    let heading = |text: &str| {
-        Line::from(Span::styled(
-            text.to_owned(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ))
-    };
     let mut lines = vec![
         heading("REPOSITORY"),
-        Line::from(picker.repository.to_owned()),
+        Line::from(picker.repository),
         Line::from(Span::styled(
             format!("Current: {}", picker.current.unwrap_or("Not mapped")),
             muted,
@@ -379,20 +353,13 @@ pub fn workspace_picker(frame: &mut Frame, picker: WorkspacePicker<'_>) {
         }),
     ];
     if let Some(name) = picker.available {
+        let accent = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
         lines.push(
             Line::from(vec![
-                Span::styled(
-                    " › ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    name.to_owned(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(" › ", accent),
+                Span::styled(name, accent),
                 Span::styled(
                     if picker.is_current {
                         "  ✓ current"
@@ -404,12 +371,7 @@ pub fn workspace_picker(frame: &mut Frame, picker: WorkspacePicker<'_>) {
             ])
             .style(Style::default().bg(Color::Rgb(24, 34, 42))),
         );
-    } else if !picker.api_key {
-        lines.push(Line::from(Span::styled(
-            " › Sign in with Linear",
-            Style::default().fg(Color::Cyan),
-        )));
-    } else {
+    } else if picker.api_key {
         lines.push(Line::from(Span::styled(
             if picker.busy {
                 "   Loading workspace…"
@@ -417,6 +379,11 @@ pub fn workspace_picker(frame: &mut Frame, picker: WorkspacePicker<'_>) {
                 "   No workspace available"
             },
             muted,
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " › Sign in with Linear",
+            Style::default().fg(Color::Cyan),
         )));
     }
     lines.extend([
@@ -430,9 +397,9 @@ pub fn workspace_picker(frame: &mut Frame, picker: WorkspacePicker<'_>) {
             muted,
         )),
         Line::default(),
-        Line::from(picker.message.to_owned()),
+        Line::from(picker.message),
     ]);
-    frame.render_widget(Clear, popup);
+    let area = popup(frame, 66, 19);
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::bordered()
@@ -448,21 +415,12 @@ pub fn workspace_picker(frame: &mut Frame, picker: WorkspacePicker<'_>) {
                 .border_style(muted)
                 .padding(Padding::new(2, 2, 1, 1)),
         ),
-        popup,
+        area,
     );
 }
 
 pub fn status_popup(frame: &mut Frame, text: String) {
-    let area = frame.area();
-    let width = area.width.min(76);
-    let height = area.height.min(18);
-    let popup = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
-    frame.render_widget(Clear, popup);
+    let area = popup(frame, 76, 18);
     frame.render_widget(
         Paragraph::new(format!("{text}\n\nEsc or s closes this popup."))
             .wrap(Wrap { trim: false })
@@ -471,7 +429,7 @@ pub fn status_popup(frame: &mut Frame, text: String) {
                     .title(" Status ")
                     .border_style(Style::default().fg(Color::Cyan)),
             ),
-        popup,
+        area,
     );
 }
 
@@ -485,18 +443,9 @@ pub fn draw_terminal(frame: &mut Frame, area: Rect, screen: &vt100::Screen, show
 }
 
 pub fn quit_popup(frame: &mut Frame) {
-    let area = frame.area();
-    let width = area.width.min(64);
-    let height = area.height.min(9);
-    let popup = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
-    frame.render_widget(Clear, popup);
+    let area = popup(frame, 64, 9);
     frame.render_widget(Paragraph::new("An editor or shell is still open.\n\nForce quit loses unsaved buffers and stops shell jobs.\nWorkspace files and Agent session IDs remain saved.\n\nf: Force quit    Esc: Return and close tools yourself")
-        .wrap(Wrap { trim: false }).block(Block::bordered().title(" Quit Mentat ")), popup);
+        .wrap(Wrap { trim: false }).block(Block::bordered().title(" Quit Mentat ")), area);
 }
 
 #[cfg(test)]
@@ -623,7 +572,7 @@ mod tests {
             items: &[],
             selected: 0,
             connected: false,
-            busy: false,
+            busy: None,
         };
         assert_eq!(
             details(&tickets, "").to_string(),

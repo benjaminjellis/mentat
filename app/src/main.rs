@@ -1,10 +1,13 @@
 mod agent_session;
 mod app;
+mod browser;
 mod cli;
 mod codex_session;
 mod config;
+mod host;
 mod linear_state;
 mod logging;
+mod session;
 mod settings;
 mod ticket;
 mod workspace;

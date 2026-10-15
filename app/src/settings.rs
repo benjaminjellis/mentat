@@ -184,16 +184,6 @@ pub fn directory() -> Result<PathBuf> {
     )
 }
 
-fn resolve_directory(xdg: Option<&Path>, home: Option<&Path>) -> Result<PathBuf> {
-    if let Some(xdg) = xdg.filter(|path| path.is_absolute()) {
-        return Ok(xdg.join("mentat"));
-    }
-    let home = home
-        .filter(|path| path.is_absolute())
-        .context("Cannot locate the user configuration directory")?;
-    Ok(home.join(".config/mentat"))
-}
-
 pub fn state_directory() -> Result<PathBuf> {
     resolve_state_directory(
         env::var_os("XDG_STATE_HOME").map(PathBuf::from).as_deref(),
@@ -201,98 +191,138 @@ pub fn state_directory() -> Result<PathBuf> {
     )
 }
 
+fn resolve_directory(xdg: Option<&Path>, home: Option<&Path>) -> Result<PathBuf> {
+    xdg_or_home(xdg, home, ".config/mentat", "configuration")
+}
+
 fn resolve_state_directory(xdg: Option<&Path>, home: Option<&Path>) -> Result<PathBuf> {
-    if let Some(xdg) = xdg.filter(|p| p.is_absolute()) {
+    xdg_or_home(xdg, home, ".local/state/mentat", "state")
+}
+
+/// Prefer an absolute XDG base directory; otherwise fall back to a path under `$HOME`.
+fn xdg_or_home(
+    xdg: Option<&Path>,
+    home: Option<&Path>,
+    fallback: &str,
+    what: &str,
+) -> Result<PathBuf> {
+    if let Some(xdg) = xdg.filter(|path| path.is_absolute()) {
         return Ok(xdg.join("mentat"));
     }
     Ok(home
-        .filter(|p| p.is_absolute())
-        .context("Cannot locate the user state directory")?
-        .join(".local/state/mentat"))
+        .filter(|path| path.is_absolute())
+        .with_context(|| format!("Cannot locate the user {what} directory"))?
+        .join(fallback))
 }
 
 impl Settings {
     pub fn load(directory: &Path) -> Result<Self> {
         let path = directory.join("config.toml");
-        let mut builder = fs::DirBuilder::new();
-        builder
-            .recursive(true)
-            .mode(0o700)
-            .create(directory)
-            .with_context(|| format!("Cannot create {}", directory.display()))?;
-
-        if !path.try_exists()? {
-            let mut file = tempfile::NamedTempFile::new_in(directory)?;
-            file.as_file()
-                .set_permissions(fs::Permissions::from_mode(0o600))?;
-            file.write_all(TEMPLATE.as_bytes())?;
-            file.as_file().sync_all()?;
-            if let Err(error) = file.persist_noclobber(&path)
-                && error.error.kind() != ErrorKind::AlreadyExists
-            {
-                return Err(error.error)
-                    .with_context(|| format!("Cannot create {}", path.display()));
-            }
-        }
-
-        let metadata = fs::symlink_metadata(&path)?;
-        ensure!(
-            metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
-            "{} must be a private regular file (mode 600)",
-            path.display()
-        );
-        let source =
-            fs::read_to_string(&path).with_context(|| format!("Cannot read {}", path.display()))?;
-        // TOML diagnostics include source lines, which can contain credentials.
-        let settings: Self = toml::from_str(&source).map_err(|_| {
+        ensure_template(directory, &path)?;
+        let source = read_private(&path)?;
+        // One parse serves both the typed settings and the section check below.
+        let table: toml::Table = toml::from_str(&source)
+            .map_err(|_| anyhow::anyhow!("Invalid configuration in {}", path.display()))?;
+        let missing = missing_sections(&table);
+        let settings = Self::deserialize(table).map_err(|_| {
             anyhow::anyhow!("Invalid TOML or unknown settings in {}", path.display())
         })?;
+        settings.validate(&path)?;
+        backfill_sections(directory, &path, &source, &missing)?;
+        Ok(settings)
+    }
+
+    fn validate(&self, path: &Path) -> Result<()> {
         for (name, value) in [
-            ("api_key", &settings.linear.api_key),
-            ("client_id", &settings.linear.client_id),
+            ("api_key", &self.linear.api_key),
+            ("client_id", &self.linear.client_id),
         ] {
             if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
                 bail!("linear.{name} must not be empty in {}", path.display());
             }
         }
-        if settings
+        if self
             .editor
             .executable
             .as_ref()
             .is_some_and(|p| p.trim().is_empty() || p.contains('\0'))
-            || settings.editor.args.iter().any(|arg| arg.contains('\0'))
+            || self.editor.args.iter().any(|arg| arg.contains('\0'))
         {
             bail!(
                 "Invalid editor executable or arguments in {}",
                 path.display()
             );
         }
-        crate::config::parse_escape(&settings.keybindings.return_to_sidebar)?;
-        // Expose the provider choice in older files without changing user settings.
-        let table: toml::Table = toml::from_str(&source)
-            .map_err(|_| anyhow::anyhow!("Invalid configuration in {}", path.display()))?;
-        let mut additions = String::new();
-        if !table.contains_key("agent") {
-            additions.push_str("\n[agent]\nkind = \"codex\" # codex or claude\n");
-        }
-        if !table.contains_key("workspace") {
-            additions.push_str("\n[workspace]\nkind = \"jj\" # jj or git\n");
-        }
-        if !additions.is_empty() {
-            let mut file = tempfile::NamedTempFile::new_in(directory)?;
-            file.as_file()
-                .set_permissions(fs::Permissions::from_mode(0o600))?;
-            write!(file, "{source}{additions}")?;
-            file.as_file().sync_all()?;
-            ensure!(
-                fs::read_to_string(&path)? == source,
-                "Configuration changed during startup; restart Mentat"
-            );
-            file.persist(&path)
-                .with_context(|| format!("Cannot update {}", path.display()))?;
-        }
-        Ok(settings)
+        crate::config::parse_escape(&self.keybindings.return_to_sidebar)?;
+        Ok(())
     }
+}
+
+/// Write the starter configuration the first time Mentat runs. A file that
+/// appears in the meantime wins; its owner may already be editing it.
+fn ensure_template(directory: &Path, path: &Path) -> Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .with_context(|| format!("Cannot create {}", directory.display()))?;
+    if path.try_exists()? {
+        return Ok(());
+    }
+    let file = private_temporary(directory, TEMPLATE)?;
+    if let Err(error) = file.persist_noclobber(path)
+        && error.error.kind() != ErrorKind::AlreadyExists
+    {
+        return Err(error.error).with_context(|| format!("Cannot create {}", path.display()));
+    }
+    Ok(())
+}
+
+fn read_private(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
+        "{} must be a private regular file (mode 600)",
+        path.display()
+    );
+    fs::read_to_string(path).with_context(|| format!("Cannot read {}", path.display()))
+}
+
+/// Sections introduced after a user's file was written, so the provider choice
+/// is visible in older configurations without changing any of their settings.
+fn missing_sections(table: &toml::Table) -> String {
+    let mut additions = String::new();
+    if !table.contains_key("agent") {
+        additions.push_str("\n[agent]\nkind = \"codex\" # codex or claude\n");
+    }
+    if !table.contains_key("workspace") {
+        additions.push_str("\n[workspace]\nkind = \"jj\" # jj or git\n");
+    }
+    additions
+}
+
+fn backfill_sections(directory: &Path, path: &Path, source: &str, additions: &str) -> Result<()> {
+    if additions.is_empty() {
+        return Ok(());
+    }
+    let file = private_temporary(directory, &format!("{source}{additions}"))?;
+    ensure!(
+        fs::read_to_string(path)? == source,
+        "Configuration changed during startup; restart Mentat"
+    );
+    file.persist(path)
+        .with_context(|| format!("Cannot update {}", path.display()))?;
+    Ok(())
+}
+
+/// Stage private content beside its destination so the replacement is atomic.
+fn private_temporary(directory: &Path, contents: &str) -> Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(contents.as_bytes())?;
+    file.as_file().sync_all()?;
+    Ok(file)
 }
 
 #[cfg(test)]

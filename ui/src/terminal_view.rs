@@ -39,11 +39,15 @@ impl TerminalSelection {
         if self
             .screen
             .cell(start.0, start.1)
-            .is_some_and(|c| c.is_wide_continuation())
+            .is_some_and(vt100::Cell::is_wide_continuation)
         {
             start.1 = start.1.saturating_sub(1);
         }
-        end.1 += if self.screen.cell(end.0, end.1).is_some_and(|c| c.is_wide()) {
+        end.1 += if self
+            .screen
+            .cell(end.0, end.1)
+            .is_some_and(vt100::Cell::is_wide)
+        {
             2
         } else {
             1
