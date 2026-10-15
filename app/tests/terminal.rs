@@ -293,7 +293,7 @@ fn neovim_receives_pane_keys_and_mouse_clicks() {
     let script = temp.path().join("editor.vim");
     let focused = temp.path().join("focused");
     fs::write(&script, format!(
-        "set mouse=a\nset noswapfile\nfile LEFT-PANE\ncall setline(1, 'LEFT-PANE')\nvsplit\nwincmd l\nenew\nfile RIGHT-PANE\ncall setline(1, 'RIGHT-PANE')\nnnoremap <C-h> <C-w>h\nnnoremap <C-l> <C-w>l\nautocmd WinEnter * call writefile([bufname('%')], '{}')\n",
+        "set mouse=a\nset guicursor=n-v-c:block,i:ver25,r:hor20\nset noswapfile\nfile LEFT-PANE\ncall setline(1, 'LEFT-PANE')\nvsplit\nwincmd l\nenew\nfile RIGHT-PANE\ncall setline(1, 'RIGHT-PANE')\nnnoremap <C-h> <C-w>h\nnnoremap <C-l> <C-w>l\nautocmd WinEnter * call writefile([bufname('%')], '{}')\n",
         focused.display(),
     )).unwrap();
     let config = temp.path().join("mentat/config.toml");
@@ -334,8 +334,27 @@ fn neovim_receives_pane_keys_and_mouse_clicks() {
     host.write(b"\x1b[108;5u").unwrap();
     expect_focus("RIGHT-PANE");
     // Full-screen tools have neither a sidebar nor a header offset.
-    host.write(b"\x07b\x1b[<0;5;2M\x1b[<0;5;2m").unwrap();
+    host.write(b"\x07f\x1b[<0;5;2M\x1b[<0;5;2m").unwrap();
     expect_focus("LEFT-PANE");
+    for (keys, expected) in [
+        (
+            b"i".as_slice(),
+            crossterm::cursor::SetCursorStyle::SteadyBar,
+        ),
+        (b"\x1b", crossterm::cursor::SetCursorStyle::SteadyBlock),
+        (b"R", crossterm::cursor::SetCursorStyle::SteadyUnderScore),
+        (b"\x1b", crossterm::cursor::SetCursorStyle::SteadyBlock),
+    ] {
+        host.write(keys).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while host.parser.lock().unwrap().callbacks().cursor_style != expected {
+            assert!(
+                Instant::now() < deadline,
+                "Cursor did not change to {expected:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
     quit(&mut host, true);
 }
 

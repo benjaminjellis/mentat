@@ -261,7 +261,7 @@ fn drain(
                     let mut parser = parser.lock().unwrap_or_else(|e| e.into_inner());
                     parser.process(&bytes[..count]);
                     changed.store(true, Ordering::Relaxed);
-                    std::mem::take(&mut parser.callbacks_mut().0)
+                    std::mem::take(&mut parser.callbacks_mut().output)
                 };
                 if !replies.is_empty() {
                     writer

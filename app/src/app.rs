@@ -1,7 +1,7 @@
 use crate::{
     agent_session,
     config::Config,
-    host::{Host, TerminalGuard, host_disconnected, host_io},
+    host::{Host, TerminalGuard, draw_frame, host_disconnected, host_io},
     linear_state::Linear,
     session::{Pane, TicketSession, View, content_area},
     settings,
@@ -12,6 +12,7 @@ use ::terminal::input;
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use crossterm::{
+    cursor::SetCursorStyle,
     event::{
         self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
@@ -22,7 +23,7 @@ use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use std::{
     collections::HashMap,
-    io::{self, IsTerminal, Write},
+    io::{self, BufWriter, IsTerminal, Write},
     process::Child,
     sync::{
         Arc,
@@ -36,7 +37,7 @@ const SCROLL_LINES: usize = 3;
 
 /// A busy child can change far faster than anyone can read. Draw at most this
 /// often, and wait at most this long for the next host event.
-const FRAME: Duration = Duration::from_millis(33);
+const FRAME: Duration = Duration::from_millis(16);
 const POLL: Duration = Duration::from_millis(16);
 
 /// What a mouse event asks of us: text for the host clipboard, and whether our
@@ -121,7 +122,7 @@ pub fn run(config: Config) -> Result<()> {
         old_hook(info);
     }));
     let _guard = TerminalGuard::enter()?;
-    let output: Box<dyn Write> = Box::new(io::stdout());
+    let output: Box<dyn Write> = Box::new(BufWriter::new(io::stdout()));
     let mut host = Terminal::new(CrosstermBackend::new(output))?;
     let result = app.event_loop(&mut host, &stop);
     // TerminalGuard restores the real terminal. Ratatui's Drop also tries to
@@ -423,7 +424,7 @@ impl App {
     }
 
     fn draw(&self, host: &mut Host) -> io::Result<()> {
-        host.draw(|frame| {
+        draw_frame(host, |frame| {
             let tickets = self.tickets();
             let display = ui::Tickets {
                 items: &tickets,
@@ -438,8 +439,9 @@ impl App {
                 self.view == View::Manager,
                 self.sidebar_visible,
             );
-            self.draw_content(frame, content, &display);
+            let cursor_style = self.draw_content(frame, content, &display);
             self.draw_overlays(frame);
+            cursor_style
         })?;
         Ok(())
     }
@@ -463,7 +465,12 @@ impl App {
 
     /// The main pane: a live child terminal, a frozen selection over it, or the
     /// ticket overview while nothing is running there.
-    fn draw_content(&self, frame: &mut ratatui::Frame, content: Rect, display: &ui::Tickets<'_>) {
+    fn draw_content(
+        &self,
+        frame: &mut ratatui::Frame,
+        content: Rect,
+        display: &ui::Tickets<'_>,
+    ) -> SetCursorStyle {
         let starting = self.session().and_then(|session| {
             session
                 .starting_at
@@ -483,18 +490,20 @@ impl App {
                 self.view == View::Overview,
                 starting,
             );
-            return;
+            return SetCursorStyle::DefaultUserShape;
         };
         if let Some(selection) = &self.selection {
             frame.render_widget(selection, content);
+            SetCursorStyle::DefaultUserShape
         } else {
             let parser = child.parser.lock().unwrap_or_else(|e| e.into_inner());
-            ui::draw_terminal(
-                frame,
-                content,
-                parser.screen(),
-                self.view != View::Manager && !self.modal_open(),
-            );
+            let focused = self.view != View::Manager && !self.modal_open();
+            ui::draw_terminal(frame, content, parser.screen(), focused);
+            if focused {
+                parser.callbacks().cursor_style
+            } else {
+                SetCursorStyle::DefaultUserShape
+            }
         }
     }
 
