@@ -13,10 +13,13 @@ const TEMPLATE: &str = r#"# Mentat configuration
 
 [workspace]
 kind = "jj" # jj or git
-# root = "../mentat-workspaces"
+# root = "~/checkouts" # default: <repository>-workspaces next to the repository
 
 [agent]
 kind = "codex" # codex or claude
+# Record workspaces Mentat creates as trusted for Claude Code, so a new ticket
+# opens straight at the prompt instead of its trust question.
+# trust_workspaces = false
 
 [editor]
 kind = "nvim" # nvim, vim, or emacs
@@ -58,29 +61,30 @@ pub struct WorkspaceSettings {
 }
 
 impl WorkspaceSettings {
-    pub fn directory(&self) -> Result<PathBuf> {
+    /// `None` leaves the per-repository default to [`crate::workspace::Workspaces::open`].
+    pub fn directory(&self) -> Result<Option<PathBuf>> {
         self.resolve_directory(env::var_os("HOME").map(PathBuf::from).as_deref())
     }
 
-    fn resolve_directory(&self, home: Option<&Path>) -> Result<PathBuf> {
-        let root = self
-            .root
-            .as_deref()
-            .unwrap_or(Path::new("../mentat-workspaces"));
+    fn resolve_directory(&self, home: Option<&Path>) -> Result<Option<PathBuf>> {
+        let Some(root) = self.root.as_deref() else {
+            return Ok(None);
+        };
         if root.is_absolute() {
-            return Ok(root.to_path_buf());
+            return Ok(Some(root.to_path_buf()));
         }
         if let Ok(relative) = root.strip_prefix("~") {
-            return Ok(home
-                .filter(|path| path.is_absolute())
-                .context("Cannot locate the home directory for workspace.root")?
-                .join(relative));
+            return Ok(Some(
+                home.filter(|path| path.is_absolute())
+                    .context("Cannot locate the home directory for workspace.root")?
+                    .join(relative),
+            ));
         }
         ensure!(
             !root.as_os_str().is_empty() && !root.to_string_lossy().starts_with('~'),
             "workspace.root must not be empty; home paths must start with ~/"
         );
-        Ok(root.to_path_buf())
+        Ok(Some(root.to_path_buf()))
     }
 }
 
@@ -103,6 +107,8 @@ pub enum AgentKind {
 #[serde(default, deny_unknown_fields)]
 pub struct AgentSettings {
     pub kind: AgentKind,
+    /// Answer Claude Code's trust question for workspaces Mentat created itself.
+    pub trust_workspaces: bool,
 }
 
 impl AgentKind {
@@ -302,13 +308,13 @@ mod tests {
     }
 
     #[test]
-    fn workspace_root_defaults_to_sibling_and_expands_home() {
+    fn workspace_root_defers_to_the_repository_default_and_expands_home() {
         let home = Some(Path::new("/home/test"));
         assert_eq!(
             WorkspaceSettings::default()
                 .resolve_directory(home)
                 .unwrap(),
-            Path::new("../mentat-workspaces")
+            None
         );
         for (root, expected) in [
             ("~/work", "/home/test/work"),
@@ -318,8 +324,12 @@ mod tests {
             let settings: Settings =
                 toml::from_str(&format!("[workspace]\nroot = '{root}'")).unwrap();
             assert_eq!(
-                settings.workspace.resolve_directory(home).unwrap(),
-                Path::new(expected)
+                settings
+                    .workspace
+                    .resolve_directory(home)
+                    .unwrap()
+                    .as_deref(),
+                Some(Path::new(expected))
             );
         }
         for root in ["", "~someone/work"] {

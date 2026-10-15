@@ -32,6 +32,31 @@ use std::{
 
 type Host = Terminal<CrosstermBackend<Box<dyn Write>>>;
 
+/// Wheel step through a child's history, in lines.
+const SCROLL_LINES: usize = 3;
+
+/// A busy child can change far faster than anyone can read. Draw at most this
+/// often, and wait at most this long for the next host event.
+const FRAME: Duration = Duration::from_millis(33);
+const POLL: Duration = Duration::from_millis(16);
+
+/// What a mouse event asks of us: text for the host clipboard, and whether our
+/// own view changed. Events forwarded to a child redraw when the child answers.
+#[derive(Default)]
+struct MouseOutcome {
+    copied: Option<String>,
+    redraw: bool,
+}
+
+impl MouseOutcome {
+    fn redraw() -> Self {
+        Self {
+            copied: None,
+            redraw: true,
+        }
+    }
+}
+
 struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
@@ -142,7 +167,7 @@ pub fn run(config: Config) -> Result<()> {
     let workspaces = Workspaces::open(
         &config.cwd,
         &settings::state_directory()?,
-        &config.workspace_root,
+        config.workspace_root.as_deref(),
         config.workspace,
     )?;
     let tracked = workspaces
@@ -294,6 +319,11 @@ impl App {
                     session.starting_at = Some(Instant::now());
                     self.config.resume = None;
                     self.config.new_conversation = false;
+                } else if paste && session.config.agent_mode && session.primary.is_some() {
+                    // The agent is already running, so Enter sends the ticket again.
+                    // A prompt that was busy when the ticket first arrived, such as
+                    // one asking about a new directory, never received it.
+                    session.paste = Some(PendingPaste::new(&issue));
                 }
             }
             View::Editor => {
@@ -663,12 +693,11 @@ impl App {
             self.focus_sidebar(size)?;
         } else if !matches!(self.view, View::Manager | View::Overview) {
             if let Some(child) = self.session().and_then(|s| s.child(self.view)) {
-                let cursor = child
-                    .parser
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .screen()
-                    .application_cursor();
+                let cursor = {
+                    let mut parser = child.parser.lock().unwrap_or_else(|e| e.into_inner());
+                    parser.screen_mut().set_scrollback(0);
+                    parser.screen().application_cursor()
+                };
                 child.write(&input::encode(key, cursor))?;
             }
         } else if key.code == KeyCode::Char('q')
@@ -677,7 +706,7 @@ impl App {
             return Ok(self.request_quit());
         } else {
             match key.code {
-                KeyCode::Char('b') => {
+                KeyCode::Char('f') => {
                     self.sidebar_visible = !self.sidebar_visible;
                     self.resize_children(size)?;
                     if !self.sidebar_visible {
@@ -733,8 +762,8 @@ impl App {
                     }
                     self.notice.clear();
                 }
-                KeyCode::Char('a') => self.open_ticket(View::Primary, true, size)?,
-                KeyCode::Enter => self.open_ticket(View::Primary, false, size)?,
+                KeyCode::Char('a') => self.open_ticket(View::Primary, false, size)?,
+                KeyCode::Enter => self.open_ticket(View::Primary, true, size)?,
                 KeyCode::Char('e') => self.open_ticket(View::Editor, false, size)?,
                 KeyCode::Char('t') => self.open_ticket(View::Shell, false, size)?,
                 _ => {}
@@ -743,7 +772,7 @@ impl App {
         Ok(false)
     }
 
-    fn mouse(&mut self, mut mouse: MouseEvent, size: (u16, u16)) -> Result<Option<String>> {
+    fn mouse(&mut self, mut mouse: MouseEvent, size: (u16, u16)) -> Result<MouseOutcome> {
         let area = ui::areas(
             ratatui::layout::Rect::new(0, 0, size.0, size.1),
             self.sidebar_visible,
@@ -770,13 +799,17 @@ impl App {
             if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
                 selection.dragging = false;
                 if selection.moved() {
-                    return Ok(Some(selection.text()));
+                    return Ok(MouseOutcome {
+                        copied: Some(selection.text()),
+                        redraw: true,
+                    });
                 }
                 self.selection = None;
             }
-            return Ok(None);
+            return Ok(MouseOutcome::redraw());
         }
 
+        let mut outcome = MouseOutcome::default();
         if matches!(
             mouse.kind,
             MouseEventKind::Down(_)
@@ -785,29 +818,44 @@ impl App {
                 | MouseEventKind::ScrollLeft
                 | MouseEventKind::ScrollRight
         ) {
-            self.selection = None;
+            outcome.redraw |= self.selection.take().is_some();
         }
         if inside && let Some(child) = self.session().and_then(|s| s.child(self.pane_view())) {
-            let parser = child.parser.lock().unwrap_or_else(|e| e.into_inner());
+            let mut parser = child.parser.lock().unwrap_or_else(|e| e.into_inner());
             let screen = parser.screen();
+            let mode = screen.mouse_protocol_mode();
+            // Agents that never ask for mouse reporting leave the wheel and the
+            // selection to us; the others steer their own view.
+            let ours = mode == ::terminal::input::MouseProtocolMode::None;
             if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                && (self.view == View::Manager
-                    || screen.mouse_protocol_mode() == ::terminal::input::MouseProtocolMode::None)
+                && (self.view == View::Manager || ours)
             {
                 let selection = ui::TerminalSelection::new(screen.clone(), mouse.row, mouse.column);
                 drop(parser);
                 self.selection = Some(selection);
+            } else if ours
+                && matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                )
+            {
+                // The emulator keeps the history the child scrolled away; show it.
+                let screen = parser.screen_mut();
+                let offset = if mouse.kind == MouseEventKind::ScrollUp {
+                    screen.scrollback().saturating_add(SCROLL_LINES)
+                } else {
+                    screen.scrollback().saturating_sub(SCROLL_LINES)
+                };
+                let before = screen.scrollback();
+                screen.set_scrollback(offset);
+                outcome.redraw |= screen.scrollback() != before;
             } else if self.view != View::Manager {
-                let bytes = input::mouse(
-                    mouse,
-                    screen.mouse_protocol_mode(),
-                    screen.mouse_protocol_encoding(),
-                );
+                let bytes = input::mouse(mouse, mode, screen.mouse_protocol_encoding());
                 drop(parser);
                 child.write(&bytes)?;
             }
         }
-        Ok(None)
+        Ok(outcome)
     }
 
     fn resize_children(&self, size: (u16, u16)) -> Result<()> {
@@ -829,6 +877,7 @@ impl App {
 
     fn event_loop(&mut self, host: &mut Host, stop: &AtomicBool) -> Result<()> {
         let mut redraw = true;
+        let mut last_draw = Instant::now() - FRAME;
         let mut last_animation = Instant::now();
         loop {
             if host_disconnected()? {
@@ -847,19 +896,25 @@ impl App {
                 redraw = true;
                 last_animation = Instant::now();
             }
-            if redraw {
+            if redraw && last_draw.elapsed() >= FRAME {
                 if host_io(self.draw(host))?.is_none() {
                     return Ok(());
                 }
                 redraw = false;
+                last_draw = Instant::now();
             }
-            let Some(ready) = host_io(event::poll(Duration::from_millis(16)))? else {
+            // A pending frame must not wait out a full poll interval.
+            let wait = if redraw {
+                FRAME.saturating_sub(last_draw.elapsed()).min(POLL)
+            } else {
+                POLL
+            };
+            let Some(ready) = host_io(event::poll(wait))? else {
                 return Ok(());
             };
             if !ready {
                 continue;
             }
-            redraw = true;
             let Some(event) = host_io(event::read())? else {
                 return Ok(());
             };
@@ -867,11 +922,13 @@ impl App {
                 Event::Resize(cols, rows) => {
                     self.selection = None;
                     self.resize_children((cols, rows))?;
+                    redraw = true;
                 }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let Some(size) = host_io(terminal::size())? else {
                         return Ok(());
                     };
+                    redraw = true;
                     match self.key(key, size) {
                         Ok(true) => return Ok(()),
                         Ok(false) => {}
@@ -891,7 +948,9 @@ impl App {
                     let Some((cols, rows)) = host_io(terminal::size())? else {
                         return Ok(());
                     };
-                    if let Some(text) = self.mouse(mouse, (cols, rows))? {
+                    let outcome = self.mouse(mouse, (cols, rows))?;
+                    redraw |= outcome.redraw;
+                    if let Some(text) = outcome.copied {
                         // OSC 52 writes the selection to the host clipboard, including over SSH.
                         let encoded = base64::engine::general_purpose::STANDARD.encode(text);
                         write!(host.backend_mut(), "\x1b]52;c;{encoded}\x1b\\")?;
@@ -904,6 +963,7 @@ impl App {
                         && !self.quit_prompt
                         && self.linear.picker.is_none() =>
                 {
+                    redraw = true;
                     self.selection = None;
                     if let Some(child) = self.session().and_then(|s| s.child(self.view)) {
                         let bracketed = child

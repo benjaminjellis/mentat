@@ -544,7 +544,7 @@ fn hiding_sidebar_gives_the_live_terminal_the_whole_screen() {
     host.write(b"t").unwrap();
     host.write(b"printf 'BEFORE='; stty size\r").unwrap();
     wait_for(&host, "BEFORE=29 72");
-    host.write(b"\x07b").unwrap();
+    host.write(b"\x07f").unwrap();
     host.write(b"printf 'FULL='; stty size\r").unwrap();
     wait_for(&host, "FULL=30 100");
     assert!(
@@ -560,6 +560,28 @@ fn hiding_sidebar_gives_the_live_terminal_the_whole_screen() {
     host.write(b"printf 'RESTORED='; stty size\r").unwrap();
     wait_for(&host, "RESTORED=29 72");
     wait_for(&host, "Workspace");
+    quit(&mut host, true);
+}
+
+#[test]
+fn the_wheel_scrolls_history_for_children_that_do_not_track_the_mouse() {
+    let temp = fixture();
+    let mut host = start(&temp);
+    wait_for(&host, "TEST-1");
+    host.write(b"t").unwrap();
+    host.write(b"i=1; while [ $i -le 60 ]; do echo MARK$i.; i=$((i+1)); done\r")
+        .unwrap();
+    wait_for(&host, "MARK60.");
+    let visible = |host: &Session| host.parser.lock().unwrap().screen().contents();
+    assert!(!visible(&host).contains("MARK1."), "{}", visible(&host));
+    // SGR wheel-up over the terminal pane; a plain shell asks for no mouse reporting.
+    for _ in 0..15 {
+        host.write(b"\x1b[<64;50;10M").unwrap();
+    }
+    wait_for(&host, "MARK1.");
+    // Typing returns to the live view.
+    host.write(b" ").unwrap();
+    wait_for(&host, "MARK60.");
     quit(&mut host, true);
 }
 
@@ -752,11 +774,17 @@ fn ticket_paste_only_seeds_new_agent_conversations() {
     let paste = b"\x1b[200~Ticket 1\n\nBody\x1b[201~";
     let mut expected = paste.to_vec();
     let mut host = start_agent(&[]);
-    host.write(b"a").unwrap();
+    host.write(b"\r").unwrap();
     wait_for(&host, "AGENT-READY");
     expect_input(&expected);
+    // `a` returns to a running agent without sending the ticket again.
     host.write(b"\x07aLIVE").unwrap();
     expected.extend_from_slice(b"LIVE");
+    expect_input(&expected);
+    // Enter on a running agent sends it again, for a prompt that was busy when
+    // the ticket first arrived.
+    host.write(b"\x07\r").unwrap();
+    expected.extend_from_slice(paste);
     expect_input(&expected);
     // Editing keys must reach the agent without changing focus or losing Shift.
     host.write(b"\x7f\x1b[127u\x1b[13;2uAFTER\r").unwrap();
@@ -773,7 +801,7 @@ fn ticket_paste_only_seeds_new_agent_conversations() {
 
     // Restoring a saved conversation must not insert the ticket again.
     let mut host = start_agent(&[]);
-    host.write(b"a").unwrap();
+    host.write(b"\r").unwrap();
     wait_for(&host, "AGENT-READY");
     host.write(b"RESTORED").unwrap();
     expected.extend_from_slice(b"RESTORED");
@@ -781,7 +809,7 @@ fn ticket_paste_only_seeds_new_agent_conversations() {
     quit(&mut host, false);
 
     let mut host = start_agent(&["--resume", "11111111-1111-4111-8111-111111111111"]);
-    host.write(b"a").unwrap();
+    host.write(b"\r").unwrap();
     wait_for(&host, "AGENT-READY");
     host.write(b"EXPLICIT").unwrap();
     expected.extend_from_slice(b"EXPLICIT");
@@ -789,7 +817,7 @@ fn ticket_paste_only_seeds_new_agent_conversations() {
     quit(&mut host, false);
 
     let mut host = start_agent(&["--new-conversation"]);
-    host.write(b"a").unwrap();
+    host.write(b"\r").unwrap();
     wait_for(&host, "AGENT-READY");
     expected.extend_from_slice(paste);
     expect_input(&expected);

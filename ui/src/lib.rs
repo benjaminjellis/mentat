@@ -285,15 +285,15 @@ pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool
     };
     let mut lines = vec![
         heading("TICKET"),
-        binding("a".into(), "Agent · paste if new".into()),
-        binding("Enter".into(), "Agent · no paste".into()),
+        binding("a".into(), "Agent".into()),
+        binding("Enter".into(), "Agent · send ticket".into()),
         binding("e".into(), format!("Open {editor}")),
         binding("t".into(), "Open shell".into()),
         binding("o".into(), "Open issue in Linear".into()),
         Line::default(),
         heading("NAVIGATION"),
         binding("j/k · ↑/↓".into(), "Select issue".into()),
-        binding("b".into(), "Sidebar / full screen".into()),
+        binding("f".into(), "Sidebar / full screen".into()),
         binding("Drag".into(), "Copy output from sidebar focus".into()),
         binding(
             format!("Ctrl-{}", escape.to_ascii_uppercase()),
@@ -602,7 +602,7 @@ mod tests {
                 "TICKET",
                 "NAVIGATION",
                 "LINEAR & APP",
-                "Agent · paste if new",
+                "Agent · send ticket",
                 "Open issue in Linear",
                 "Sidebar / full screen",
                 "Ctrl-G",
