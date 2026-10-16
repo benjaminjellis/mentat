@@ -476,36 +476,52 @@ fn path_component(value: &str) -> String {
     }
 }
 
-fn git(directory: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+/// Run a version control command with its pager and colour disabled. Both
+/// backends are driven the same way; only their names and advice differ.
+fn vcs(tool: &Vcs, directory: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new(tool.program)
         .current_dir(directory)
-        .args(["--no-pager", "-c", "color.ui=false"])
+        .args(tool.globals)
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .context("Cannot run git; install Git and start Mentat in a Git repository")?;
+        .context(tool.unavailable)?;
     ensure!(
         output.status.success(),
-        "Git failed: {}",
+        "{} failed: {}",
+        tool.label,
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+struct Vcs {
+    program: &'static str,
+    globals: &'static [&'static str],
+    label: &'static str,
+    unavailable: &'static str,
+}
+
+const GIT: Vcs = Vcs {
+    program: "git",
+    globals: &["--no-pager", "-c", "color.ui=false"],
+    label: "Git",
+    unavailable: "Cannot run git; install Git and start Mentat in a Git repository",
+};
+
+const JJ: Vcs = Vcs {
+    program: "jj",
+    globals: &["--no-pager", "--color=never"],
+    label: "Jujutsu",
+    unavailable: "Cannot run jj; install Jujutsu and start Mentat in a jj repository",
+};
+
+fn git(directory: &Path, args: &[&str]) -> Result<String> {
+    vcs(&GIT, directory, args)
+}
+
 fn jj(directory: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("jj")
-        .current_dir(directory)
-        .args(["--no-pager", "--color=never"])
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .context("Cannot run jj; install Jujutsu and start Mentat in a jj repository")?;
-    ensure!(
-        output.status.success(),
-        "Jujutsu failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    vcs(&JJ, directory, args)
 }
 
 #[cfg(test)]
