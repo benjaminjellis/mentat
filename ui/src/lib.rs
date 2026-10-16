@@ -68,6 +68,7 @@ fn heading(label: &str) -> Line<'_> {
 
 pub struct Areas {
     pub sidebar: Rect,
+    pub activity: Rect,
     pub content: Rect,
     pub header: Rect,
 }
@@ -76,6 +77,7 @@ pub fn areas(area: Rect, sidebar_visible: bool) -> Areas {
     if !sidebar_visible {
         return Areas {
             sidebar: Rect::default(),
+            activity: Rect::default(),
             content: area,
             header: Rect::default(),
         };
@@ -84,8 +86,14 @@ pub fn areas(area: Rect, sidebar_visible: bool) -> Areas {
     let header_height = area.height.min(1);
     let height = area.height.saturating_sub(header_height);
     let content_y = area.y + header_height;
+    let (sidebar, activity) = if sidebar_width > 0 {
+        sidebar_areas(Rect::new(area.x, content_y, sidebar_width, height))
+    } else {
+        (Rect::default(), Rect::default())
+    };
     Areas {
-        sidebar: Rect::new(area.x, content_y, sidebar_width, height),
+        sidebar,
+        activity,
         content: Rect::new(
             area.x + sidebar_width,
             content_y,
@@ -242,36 +250,90 @@ pub fn details<'a>(linear: &Tickets<'a>, notice: &'a str) -> Text<'a> {
     text
 }
 
+pub struct Comment<'a> {
+    pub author: &'a str,
+    pub created_at: &'a str,
+    pub body: &'a str,
+}
+
+pub fn append_comments(text: &mut Text<'_>, comments: &[Comment<'_>], status: Option<&str>) {
+    text.lines.push(Line::default());
+    text.lines.push(Line::styled(
+        format!("COMMENTS ({})", comments.len()),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ));
+    text.lines.push(Line::default());
+    for comment in comments {
+        text.lines.push(Line::from(vec![
+            Span::styled(comment.author.to_owned(), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("  ·  {}", comment.created_at),
+                Style::default().fg(TICKET_MUTED),
+            ),
+        ]));
+        text.lines
+            .extend(comment.body.lines().map(|line| Line::raw(line.to_owned())));
+        text.lines.push(Line::default());
+    }
+    if let Some(message) = status {
+        text.lines.push(Line::styled(
+            message.to_owned(),
+            Style::default().fg(TICKET_MUTED),
+        ));
+    } else if comments.is_empty() {
+        text.lines.push(Line::styled(
+            "No comments yet.",
+            Style::default().fg(TICKET_MUTED),
+        ));
+    }
+    text.lines.push(Line::styled(
+        "i edit · Ctrl-N comments · PgUp/PgDn scroll",
+        Style::default().fg(TICKET_MUTED),
+    ));
+}
+
 pub fn draw_details(
     frame: &mut Frame,
     area: Rect,
     text: Text<'_>,
     focused: bool,
     starting: Option<(&str, Duration)>,
+    scroll: u16,
 ) {
     let startup_title = starting.map_or_else(String::new, |(agent, elapsed)| {
         format!(" Starting {agent}… {} ", spinner(elapsed))
     });
     frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-            Block::bordered()
-                .title(" Ticket overview ")
-                .title(
-                    Line::from(Span::styled(
-                        startup_title,
-                        Style::default().fg(Color::Cyan),
-                    ))
-                    .right_aligned(),
-                )
-                .border_style(if focused {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(TICKET_MUTED)
-                })
-                .padding(Padding::horizontal(1)),
-        ),
+        Paragraph::new(text)
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::bordered()
+                    .title(" Ticket overview ")
+                    .title_bottom(Line::from(vec![
+                        Span::styled(" i", Style::default().fg(Color::Cyan)),
+                        Span::raw(" edit · "),
+                        Span::styled("?", Style::default().fg(Color::Cyan)),
+                        Span::raw(" help "),
+                    ]))
+                    .title(
+                        Line::from(Span::styled(
+                            startup_title,
+                            Style::default().fg(Color::Cyan),
+                        ))
+                        .right_aligned(),
+                    )
+                    .border_style(if focused {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(TICKET_MUTED)
+                    })
+                    .padding(Padding::horizontal(1)),
+            ),
         area,
     );
 }
@@ -285,6 +347,7 @@ pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool
     };
     let mut lines = vec![
         heading("  TICKET"),
+        binding("i".into(), "Edit issue / comments".into()),
         binding("a".into(), "Agent".into()),
         binding("Enter".into(), "Agent · send ticket".into()),
         binding("e".into(), format!("Open {editor}")),
@@ -437,7 +500,12 @@ pub fn status_popup(frame: &mut Frame, text: String) {
 pub fn draw_terminal(frame: &mut Frame, area: Rect, screen: &vt100::Screen, show_cursor: bool) {
     frame.render_widget(TerminalView(screen), area);
     let (row, col) = screen.cursor_position();
-    if show_cursor && !screen.hide_cursor() && row < area.height && col < area.width {
+    if show_cursor
+        && screen.scrollback() == 0
+        && !screen.hide_cursor()
+        && row < area.height
+        && col < area.width
+    {
         frame.set_cursor_position((area.x + col, area.y + row));
     }
 }
@@ -552,6 +620,7 @@ mod tests {
                 "NAVIGATION",
                 "LINEAR & APP",
                 "Agent · send ticket",
+                "Edit issue / comments",
                 "Open issue in Linear",
                 "Sidebar / full screen",
                 "Ctrl-G",
@@ -584,9 +653,147 @@ mod tests {
                 .draw(|frame| {
                     let content = draw(frame, &tickets, "/home/user/project", true, true);
                     assert_eq!(content.width, if width >= 70 { width - 28 } else { width });
-                    draw_details(frame, content, details(&tickets, ""), false, None);
+                    draw_details(frame, content, details(&tickets, ""), false, None, 0);
                 })
                 .unwrap();
+        }
+    }
+}
+
+fn sidebar_areas(area: Rect) -> (Rect, Rect) {
+    let height = if area.height < 12 {
+        area.height.min(1)
+    } else {
+        (area.height / 4).clamp(3, 8)
+    };
+    (
+        Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            area.height.saturating_sub(height),
+        ),
+        Rect::new(
+            area.x,
+            area.bottom().saturating_sub(height),
+            area.width,
+            height,
+        ),
+    )
+}
+pub fn draw_activity(frame: &mut Frame, area: Rect, events: &[String], scroll: usize) {
+    let end = events
+        .len()
+        .saturating_sub(scroll.min(events.len().saturating_sub(1)));
+    if area.height <= 1 {
+        frame.render_widget(
+            Paragraph::new(
+                events
+                    .get(end.saturating_sub(1))
+                    .map_or("No activity yet", String::as_str),
+            )
+            .style(Style::default().fg(TICKET_MUTED)),
+            area,
+        );
+        return;
+    }
+    let block = Block::bordered()
+        .title(" Activity ")
+        .border_style(Style::default().fg(TICKET_MUTED))
+        .padding(Padding::horizontal(1));
+    let count = area.height.saturating_sub(2) as usize;
+    let width = block.inner(area).width.max(1) as usize;
+    let mut wrapped = Vec::new();
+    for event in &events[..end] {
+        let (timestamp, message) = event.split_once("  ").unwrap_or(("", event.as_str()));
+        if !timestamp.is_empty() {
+            wrapped.push(timestamp.to_owned());
+        }
+        let mut line = String::new();
+        for word in message.split_whitespace() {
+            if !line.is_empty() && Line::raw(format!("{line} {word}")).width() > width {
+                wrapped.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            for c in word.chars() {
+                if Line::raw(format!("{line}{c}")).width() > width && !line.is_empty() {
+                    wrapped.push(std::mem::take(&mut line));
+                }
+                line.push(c);
+            }
+        }
+        if !line.is_empty() {
+            wrapped.push(line);
+        }
+    }
+    if wrapped.is_empty() {
+        wrapped.push("No activity yet".into());
+    }
+    let lines: Vec<Line> = wrapped[wrapped.len().saturating_sub(count)..]
+        .iter()
+        .map(|s| Line::raw(s.as_str()))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(TICKET_MUTED))
+            .block(block),
+        area,
+    );
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    #[test]
+    fn comments_show_authors_bodies_and_empty_or_failed_states() {
+        let mut text = Text::default();
+        append_comments(
+            &mut text,
+            &[Comment {
+                author: "Sam",
+                created_at: "2026-10-14",
+                body: "First line\nSecond line",
+            }],
+            None,
+        );
+        let rendered = text.to_string();
+        for expected in [
+            "COMMENTS (1)",
+            "Sam",
+            "2026-10-14",
+            "First line",
+            "Second line",
+        ] {
+            assert!(rendered.contains(expected));
+        }
+        let mut empty = Text::default();
+        append_comments(&mut empty, &[], Some("Comments unavailable"));
+        assert!(empty.to_string().contains("Comments unavailable"));
+        assert!(!empty.to_string().contains("No comments yet"));
+    }
+    #[test]
+    fn activity_is_left_of_full_height_content_and_hides_with_sidebar() {
+        let layout = areas(Rect::new(0, 0, 100, 30), true);
+        assert_eq!(layout.activity.x, 0);
+        assert_eq!(layout.sidebar.bottom(), layout.activity.y);
+        assert_eq!(layout.activity.right(), layout.content.x);
+        assert_eq!(layout.content.height, 29);
+        assert_eq!(
+            areas(Rect::new(0, 0, 100, 30), false).activity,
+            Rect::default()
+        );
+    }
+    #[test]
+    fn sidebar_split_preserves_bounds_at_all_sizes() {
+        for height in 0..80 {
+            let area = Rect::new(0, 1, 28, height);
+            let (ticket, activity) = sidebar_areas(area);
+            assert_eq!(ticket.bottom(), activity.y);
+            assert_eq!(activity.bottom(), area.bottom());
+            assert_eq!(activity.width, ticket.width);
+            assert!(activity.height <= 8);
         }
     }
 }

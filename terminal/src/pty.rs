@@ -98,6 +98,13 @@ impl Session {
     }
 
     pub fn write(&self, bytes: &[u8]) -> Result<()> {
+        if !bytes.is_empty() {
+            let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+            if parser.screen().scrollback() != 0 {
+                parser.screen_mut().set_scrollback(0);
+                self.changed.store(true, Ordering::Relaxed);
+            }
+        }
         self.writer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
