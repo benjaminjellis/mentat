@@ -35,6 +35,8 @@ pub struct Issue {
     pub title: String,
     pub description: Option<String>,
     pub url: String,
+    #[serde(default, rename = "branchName")]
+    pub branch_name: Option<String>,
     pub state: Named,
     pub team: Named,
 }
@@ -255,7 +257,7 @@ const QUERY: &str = r#"query MentatIssues($after: String) {
     name
     assignedIssues(first: 50, after: $after, orderBy: updatedAt,
       filter: {state: {type: {nin: ["completed", "canceled"]}}}) {
-      nodes { id identifier title description url state { name } team { name } }
+      nodes { id identifier title description url branchName state { name } team { name } }
       pageInfo { hasNextPage endCursor }
     }
   }
@@ -312,7 +314,7 @@ mod tests {
     fn page(id: &str, next: bool) -> serde_json::Value {
         json!({"data": {"viewer": {"name": "A", "assignedIssues": {
             "nodes": [{"id": id, "identifier": id, "title": "Ticket", "description": null,
-                "url": "https://linear.app/test", "state": {"name": "Todo"}, "team": {"name": "Team"}}],
+                "url": "https://linear.app/test", "branchName": "ben/eng-1-ticket", "state": {"name": "Todo"}, "team": {"name": "Team"}}],
             "pageInfo": {"hasNextPage": next, "endCursor": id}
         }}}})
     }
@@ -391,6 +393,10 @@ mod tests {
             let mut client = Client::from_token(token).unwrap();
             client.set_base_url(server.uri());
             let snapshot = fetch(&client, &AtomicBool::new(false)).await.unwrap();
+            assert_eq!(
+                snapshot.issues[0].branch_name.as_deref(),
+                Some("ben/eng-1-ticket")
+            );
             assert_eq!(
                 snapshot
                     .issues

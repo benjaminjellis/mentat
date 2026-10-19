@@ -135,8 +135,12 @@ impl Form {
                 self.cursor = self.text().map_or(0, String::len);
                 self.scroll = None;
             }
-            KeyCode::PageDown => self.scroll = Some(self.scroll.unwrap_or(0).saturating_add(5)),
-            KeyCode::PageUp => self.scroll = Some(self.scroll.unwrap_or(0).saturating_sub(5)),
+            KeyCode::Down if key.modifiers == KeyModifiers::CONTROL => {
+                self.scroll = Some(self.scroll.unwrap_or(0).saturating_add(1));
+            }
+            KeyCode::Up if key.modifiers == KeyModifiers::CONTROL => {
+                self.scroll = Some(self.scroll.unwrap_or(0).saturating_sub(1));
+            }
             KeyCode::Left | KeyCode::Right if self.text().is_some() => {
                 let value = self.text().unwrap();
                 self.cursor = if key.code == KeyCode::Left {
@@ -419,7 +423,7 @@ impl Form {
             ),
         );
         let hint = if inner.width >= 42 {
-            "Esc back · Tab focus · Ctrl-N tabs · PgUp/Dn"
+            "Esc back · Tab focus · Ctrl-N tabs · Ctrl-↑↓ scroll"
         } else {
             "Esc back · Tab · Ctrl-N"
         };

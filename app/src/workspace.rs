@@ -33,6 +33,16 @@ pub struct Workspace {
     pub cleanup: bool,
 }
 
+pub struct WorkspaceLock(fs::File);
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        // Closing alone can leave the lock held by a concurrently forked child
+        // until it execs. Release it explicitly when the owner is finished.
+        let _ = self.0.unlock();
+    }
+}
+
 impl Workspaces {
     pub fn open(
         source: &Path,
@@ -243,7 +253,7 @@ impl Workspaces {
             .join(format!("{ticket_name}-{}", &repository_id[..8])))
     }
 
-    pub fn lock(&self, record: &Workspace) -> Result<fs::File> {
+    pub fn lock(&self, record: &Workspace) -> Result<WorkspaceLock> {
         let path = self.locks.join(format!("{}.lock", record.name));
         let file = fs::OpenOptions::new()
             .create(true)
@@ -253,7 +263,7 @@ impl Workspaces {
             .open(path)?;
         file.try_lock()
             .context("Another Mentat session uses this ticket workspace")?;
-        Ok(file)
+        Ok(WorkspaceLock(file))
     }
 
     fn validate_record(&self, record: &Workspace) -> Result<()> {
@@ -524,9 +534,131 @@ fn jj(directory: &Path, args: &[&str]) -> Result<String> {
     vcs(&JJ, directory, args)
 }
 
+pub fn create_bookmark(directory: &Path, name: &str) -> Result<()> {
+    jj(
+        directory,
+        &["bookmark", "set", "--revision", "@", "--", name],
+    )?;
+    jj(
+        directory,
+        &["bookmark", "track", "--remote=origin", "--", name],
+    )
+    .context("Bookmark set at @, but tracking on origin failed")?;
+    Ok(())
+}
+
+pub struct Push {
+    child: std::process::Child,
+    output: fs::File,
+}
+
+impl Push {
+    pub fn start(directory: &Path) -> Result<Self> {
+        let output = tempfile::tempfile()?;
+        let child = Command::new(JJ.program)
+            .current_dir(directory)
+            .args(JJ.globals)
+            .args(["git", "push"])
+            .stdin(Stdio::null())
+            .stdout(output.try_clone()?)
+            .stderr(output.try_clone()?)
+            .spawn()
+            .context(JJ.unavailable)?;
+        Ok(Self { child, output })
+    }
+
+    pub fn poll(&mut self) -> Result<Option<String>> {
+        use std::io::{Read, Seek};
+
+        let Some(status) = self.child.try_wait()? else {
+            return Ok(None);
+        };
+        self.output.rewind()?;
+        let mut output = String::new();
+        self.output.read_to_string(&mut output)?;
+        ensure!(status.success(), "jj git push failed: {}", output.trim());
+        Ok(Some(format!("jj git push completed. {}", output.trim())))
+    }
+}
+
+impl Drop for Push {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linear_bookmark_targets_ticket_workspace_and_tracks_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        jj(
+            temp.path(),
+            &["git", "init", "--no-colocate", repo.to_str().unwrap()],
+        )
+        .unwrap();
+        jj(
+            &repo,
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                temp.path().join("remote").to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let workspaces = Workspaces::open(
+            &repo,
+            &temp.path().join("state"),
+            Some(&temp.path().join("checkouts")),
+            WorkspaceKind::Jj,
+        )
+        .unwrap();
+        let ticket = workspaces.ensure("one", "ENG-1").unwrap();
+        let name = "ben/eng-1-ticket";
+        create_bookmark(&ticket.path, name).unwrap();
+        let target = jj(
+            &ticket.path,
+            &["log", "--no-graph", "-r", name, "-T", "commit_id"],
+        )
+        .unwrap();
+        assert_eq!(
+            target,
+            jj(
+                &ticket.path,
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id"]
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            target,
+            jj(&repo, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]).unwrap()
+        );
+        jj(&ticket.path, &["new"]).unwrap();
+        create_bookmark(&ticket.path, name).unwrap();
+        assert_eq!(
+            jj(
+                &ticket.path,
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id"]
+            )
+            .unwrap(),
+            jj(
+                &ticket.path,
+                &["log", "--no-graph", "-r", name, "-T", "commit_id"]
+            )
+            .unwrap()
+        );
+        assert!(
+            jj(&ticket.path, &["bookmark", "list", "--tracked"])
+                .unwrap()
+                .contains("@origin")
+        );
+    }
 
     #[test]
     fn workspace_roots_sit_next_to_the_repository_when_started_in_subdirectory() {

@@ -64,6 +64,7 @@ struct App {
     sidebar_visible: bool,
     selection: Option<ui::TerminalSelection>,
     link_openers: Vec<(String, Child)>,
+    pushes: HashMap<String, crate::workspace::Push>,
     help: bool,
     status: bool,
     quit_prompt: bool,
@@ -106,6 +107,7 @@ pub fn run(config: Config) -> Result<()> {
         sidebar_visible: true,
         selection: None,
         link_openers: Vec::new(),
+        pushes: HashMap::new(),
         help: false,
         status: false,
         quit_prompt: false,
@@ -307,10 +309,27 @@ impl App {
         let mut redraw = self.linear.poll();
         redraw |= self.poll_edits();
         redraw |= self.poll_link_openers();
+        redraw |= self.poll_pushes();
         redraw |= self.poll_linear()?;
         redraw |= self.poll_sessions()?;
         redraw |= self.poll_cleanup()?;
         Ok(redraw)
+    }
+
+    fn poll_pushes(&mut self) -> bool {
+        let mut redraw = false;
+        self.pushes.retain(|id, push| {
+            let message = match push.poll() {
+                Ok(None) => return true,
+                Ok(Some(message)) => message,
+                Err(error) => format!("{error:#}"),
+            };
+            self.notice = message.clone();
+            record_event(&mut self.activity, id.clone(), message);
+            redraw = true;
+            false
+        });
+        redraw
     }
 
     fn poll_edits(&mut self) -> bool {
@@ -502,6 +521,9 @@ impl App {
         }
         let mut redraw = false;
         for record in self.workspaces.list()?.into_iter().filter(|w| w.cleanup) {
+            if self.pushes.contains_key(&record.ticket_id) {
+                continue;
+            }
             if self
                 .sessions
                 .get(&record.ticket_id)
@@ -576,6 +598,7 @@ impl App {
                 .iter()
                 .map(|i| ui::Ticket {
                     identifier: &i.identifier,
+                    has_workspace: self.linear.tracked.contains(&i.id),
                     title: &i.title,
                     status: &i.state.name,
                     team: &i.team.name,
@@ -846,6 +869,17 @@ impl App {
             }
 
             KeyCode::Char('o') => self.open_in_linear()?,
+            KeyCode::Char('b') => self.create_bookmark()?,
+            KeyCode::Char('p') => self.push_ticket()?,
+            KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up
+                if self.view == View::Overview =>
+            {
+                self.overview_scroll = if matches!(key.code, KeyCode::Char('j') | KeyCode::Down) {
+                    self.overview_scroll.saturating_add(1)
+                } else {
+                    self.overview_scroll.saturating_sub(1)
+                };
+            }
             KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up => {
                 let step = if matches!(key.code, KeyCode::Char('j') | KeyCode::Down) {
                     1
@@ -866,9 +900,18 @@ impl App {
                     form.load_pending = self.config.linear.is_some();
                 }
             }
-            KeyCode::PageDown => self.overview_scroll = self.overview_scroll.saturating_add(5),
-            KeyCode::PageUp => self.overview_scroll = self.overview_scroll.saturating_sub(5),
             KeyCode::Char('i') => {
+                if let Some(id) = self.linear.issue().map(|issue| issue.id.clone()) {
+                    self.current = Some(id.clone());
+                    self.view = View::Overview;
+                    self.overview_scroll = 0;
+                    let form = self.forms.entry(id).or_default();
+                    if !form.busy {
+                        form.load_pending = self.config.linear.is_some();
+                    }
+                }
+            }
+            KeyCode::Char('e') if self.view == View::Overview => {
                 if let Some(id) = self.linear.issue().map(|i| i.id.clone()) {
                     let started = self.linear.edit(id.clone(), ::linear::EditOperation::Load);
                     let form = self.forms.entry(id.clone()).or_default();
@@ -891,6 +934,65 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    fn push_ticket(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.config.workspace == crate::settings::WorkspaceKind::Jj,
+            "jj git push requires the jj workspace backend"
+        );
+        let issue = self
+            .linear
+            .issue()
+            .context("Select a Linear ticket first")?
+            .clone();
+        anyhow::ensure!(
+            !self.pushes.contains_key(&issue.id),
+            "A push is already active for this ticket"
+        );
+        self.ensure_session(&issue)?;
+        let directory = &self
+            .sessions
+            .get(&issue.id)
+            .expect("ticket session exists")
+            .config
+            .cwd;
+        let push = crate::workspace::Push::start(directory)?;
+        self.pushes.insert(issue.id.clone(), push);
+        self.notice = format!("Started jj git push for {}.", issue.identifier);
+        self.record(issue.id, self.notice.clone());
+        Ok(())
+    }
+
+    fn create_bookmark(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.config.workspace == crate::settings::WorkspaceKind::Jj,
+            "Linear bookmarks require the jj workspace backend"
+        );
+        let issue = self
+            .linear
+            .issue()
+            .context("Select a Linear ticket first")?
+            .clone();
+        let name = issue
+            .branch_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .context("This issue has no Linear branch name; press r to refresh issues")?;
+        self.ensure_session(&issue)?;
+        let directory = &self
+            .sessions
+            .get(&issue.id)
+            .expect("ticket session exists")
+            .config
+            .cwd;
+        crate::workspace::create_bookmark(directory, name)?;
+        self.notice = format!(
+            "Set bookmark {name} at @ in {} and track it on origin.",
+            issue.identifier
+        );
+        self.record(issue.id, self.notice.clone());
+        Ok(())
     }
 
     /// Hand the selected ticket to the system browser, reported once it exits.
