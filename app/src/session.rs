@@ -1,10 +1,15 @@
-use crate::{agent_session, config::Config, ticket::PendingPaste, workspace::Workspaces};
+use crate::{
+    agent_session,
+    config::Config,
+    ticket::PendingPaste,
+    workspace::{WorkspaceLock, Workspaces},
+};
 use ::terminal::pty::Session;
 use anyhow::Result;
 use crossterm::terminal;
 use ratatui::layout::Rect;
 use std::ffi::OsString;
-use std::{fs::File, time::Instant};
+use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum View {
@@ -55,7 +60,7 @@ pub struct TicketSession {
     pub starting_at: Option<Instant>,
     pub last: View,
     pub paste: Option<PendingPaste>,
-    pub _lock: File,
+    pub _lock: WorkspaceLock,
 }
 impl TicketSession {
     pub fn pane(&self, pane: Pane) -> Option<&Session> {

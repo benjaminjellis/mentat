@@ -68,6 +68,7 @@ mod tests {
             title: "Fix the bug".into(),
             description: body.map(str::to_owned),
             url: "url".into(),
+            branch_name: None,
             state: linear::Named {
                 name: "Todo".into(),
             },

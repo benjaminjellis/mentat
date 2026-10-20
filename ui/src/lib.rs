@@ -13,6 +13,7 @@ use std::time::Duration;
 
 pub struct Ticket<'a> {
     pub identifier: &'a str,
+    pub has_workspace: bool,
     pub title: &'a str,
     pub status: &'a str,
     pub team: &'a str,
@@ -153,13 +154,29 @@ pub fn draw(
             .items
             .iter()
             .map(|issue| {
+                let mut identifier = Line::from(Span::styled(
+                    issue.identifier,
+                    Style::default()
+                        .fg(TICKET_ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                if issue.has_workspace {
+                    // Leave room for the selection arrow, a gap, and the dot.
+                    let width = usize::from(inner.width.saturating_sub(2));
+                    let mut text = String::new();
+                    for c in issue.identifier.chars() {
+                        let next = format!("{text}{c}");
+                        if Line::raw(next.clone()).width() > width.saturating_sub(2) {
+                            break;
+                        }
+                        text = next;
+                    }
+                    identifier.spans[0].content = text.into();
+                    identifier.push_span(" ".repeat(width.saturating_sub(identifier.width() + 1)));
+                    identifier.push_span(Span::styled("●", Style::default().fg(Color::LightGreen)));
+                }
                 ListItem::new(vec![
-                    Line::from(Span::styled(
-                        issue.identifier,
-                        Style::default()
-                            .fg(TICKET_ACCENT)
-                            .add_modifier(Modifier::BOLD),
-                    )),
+                    identifier,
                     Line::from(Span::styled(
                         format!("  {}", issue.title),
                         Style::default().fg(TICKET_TEXT),
@@ -289,7 +306,7 @@ pub fn append_comments(text: &mut Text<'_>, comments: &[Comment<'_>], status: Op
         ));
     }
     text.lines.push(Line::styled(
-        "i edit · Ctrl-N comments · PgUp/PgDn scroll",
+        "i open · e edit ticket · ↑↓ scroll",
         Style::default().fg(TICKET_MUTED),
     ));
 }
@@ -347,13 +364,14 @@ pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool
     };
     let mut lines = vec![
         heading("  TICKET"),
-        binding("i".into(), "Edit issue / comments".into()),
+        binding("i, then e".into(), "Open ticket, then edit".into()),
         binding("a".into(), "Agent".into()),
         binding("Enter".into(), "Agent · send ticket".into()),
         binding("e".into(), format!("Open {editor}")),
         binding("t".into(), "Open shell".into()),
         binding("o".into(), "Open issue in Linear".into()),
-        Line::default(),
+        binding("b".into(), "Linear bookmark (jj)".into()),
+        binding("p".into(), "Push (jj git push)".into()),
         heading("  NAVIGATION"),
         binding("j/k · ↑/↓".into(), "Select issue".into()),
         binding("f".into(), "Sidebar / full screen".into()),
@@ -370,7 +388,6 @@ pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool
         ));
     }
     lines.extend([
-        Line::default(),
         heading("  LINEAR & APP"),
         binding("l".into(), "Choose Linear workspace".into()),
         binding("r".into(), "Refresh issues".into()),
@@ -520,6 +537,54 @@ pub fn quit_popup(frame: &mut Frame) {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn workspace_dot_preserves_alignment_and_selection() {
+        let items = [true, false].map(|has_workspace| Ticket {
+            identifier: "APP-1",
+            has_workspace,
+            title: "Example ticket",
+            status: "Todo",
+            team: "App",
+            url: "",
+            description: None,
+        });
+        for selected in 0..items.len() {
+            let tickets = Tickets {
+                items: &items,
+                selected,
+                connected: true,
+                busy: None,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(frame, &tickets, "/project", true, true);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for (index, item) in items.iter().enumerate() {
+                let y = 2 + index as u16 * 2;
+                let row = (1..8).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+                assert_eq!(
+                    row,
+                    format!("{}APP-1", if index == selected { "› " } else { "  " },)
+                );
+                assert_eq!(
+                    buffer[(26, y)].symbol(),
+                    if item.has_workspace { "●" } else { " " }
+                );
+                if item.has_workspace {
+                    assert_eq!(buffer[(26, y)].fg, Color::LightGreen);
+                    assert_ne!(buffer[(26, y)].fg, buffer[(3, y)].fg);
+                }
+                if index == selected {
+                    assert_eq!(buffer[(26, y)].bg, TICKET_SELECTED);
+                }
+            }
+        }
+    }
+
     #[test]
     fn workspace_picker_shows_selection_and_controls_at_multiple_sizes() {
         for (width, height) in [(40, 20), (80, 24), (120, 40)] {
@@ -620,8 +685,10 @@ mod tests {
                 "NAVIGATION",
                 "LINEAR & APP",
                 "Agent · send ticket",
-                "Edit issue / comments",
+                "Open ticket, then edit",
                 "Open issue in Linear",
+                "Linear bookmark (jj)",
+                "Push (jj git push)",
                 "Sidebar / full screen",
                 "Ctrl-G",
                 "Quit",

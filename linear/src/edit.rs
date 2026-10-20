@@ -140,7 +140,7 @@ async fn call<T: serde::de::DeserializeOwned>(
     }).await
 }
 async fn load(client: &Client, id: &str, cancel: &AtomicBool) -> Result<Details> {
-    let value: serde_json::Value = call(client, cancel, "query MentatDetails($id: String!) { issue(id: $id) { id identifier title description url priority state { id name } team { name states { nodes { id name } } } } }", json!({"id": id}), "issue").await?;
+    let value: serde_json::Value = call(client, cancel, "query MentatDetails($id: String!) { issue(id: $id) { id identifier title description url branchName priority state { id name } team { name states { nodes { id name } } } } }", json!({"id": id}), "issue").await?;
     let mut details = Details {
         issue: serde_json::from_value(value.clone())?,
         priority: serde_json::from_value(value["priority"].clone())?,

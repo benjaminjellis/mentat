@@ -270,6 +270,53 @@ fn opens_selected_linear_issue_and_reports_opener_errors() {
 }
 
 #[test]
+fn push_shortcut_reports_errors_for_the_selected_ticket() {
+    let temp = fixture();
+    // Empty pushes and config discovery vary between jj versions/platforms.
+    // Fail only the push command; use real jj for workspace creation.
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let jj = bin.join("jj");
+    fs::write(
+        &jj,
+        r#"#!/bin/sh
+if [ "$*" = "--no-pager --color=never git push" ]; then
+    pwd -P > "$PUSH_DIRECTORY"
+    printf 'Fixture push rejected\n' >&2
+    exit 1
+fi
+PATH="$REAL_JJ_PATH" exec jj "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&jj, fs::Permissions::from_mode(0o700)).unwrap();
+    let capture = temp.path().join("push-directory");
+    let path = std::env::var("PATH").unwrap();
+    let mut host = start_with_env(
+        &temp,
+        &[
+            format!("PATH={}:{}", bin.display(), path).into(),
+            format!("REAL_JJ_PATH={path}").into(),
+            format!("PUSH_DIRECTORY={}", capture.display()).into(),
+        ],
+    );
+    wait_for(&host, "TEST-1");
+    host.write(b"jp").unwrap();
+    wait_for(&host, "jj git push failed:");
+    wait_for(&host, "Fixture push rejected");
+    assert!(temp.path().join("checkouts/TEST-2/.jj").is_dir());
+    assert_eq!(
+        std::path::Path::new(fs::read_to_string(&capture).unwrap().trim()),
+        temp.path().join("checkouts/TEST-2").canonicalize().unwrap()
+    );
+    assert!(!temp.path().join("checkouts/TEST-1").exists());
+    host.write(b"?").unwrap();
+    wait_for(&host, "Push (jj git push)");
+    host.write(b"?").unwrap();
+    quit(&mut host, false);
+}
+
+#[test]
 fn tool_shortcuts_open_interactive_sessions() {
     for key in [b"a", b"\r", b"e", b"t"] {
         let temp = fixture();
@@ -990,6 +1037,17 @@ fn issue_form_keeps_text_local_and_activity_is_separate() {
         );
     }
     host.write(b"i").unwrap();
+    wait_for(&host, "e edit ticket");
+    assert!(
+        !host
+            .parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("Linear issue")
+    );
+    host.write(b"e").unwrap();
     wait_for(&host, "Linear issue");
     // The fixture has cached tickets but no credentials; failed loading must
     // leave a usable form, and q must type text instead of quitting.
@@ -1001,7 +1059,7 @@ fn issue_form_keeps_text_local_and_activity_is_separate() {
     wait_for(&host, "draftq pasted");
     host.write(b"\x1b").unwrap();
     wait_for(&host, "Ticket overview");
-    host.write(b"i").unwrap();
+    host.write(b"e").unwrap();
     wait_for(&host, "draftq pasted");
     host.write(b"\x1b").unwrap();
     wait_for(&host, "Ticket overview");
