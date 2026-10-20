@@ -392,6 +392,7 @@ pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool
         binding("l".into(), "Choose Linear workspace".into()),
         binding("r".into(), "Refresh issues".into()),
         binding("s".into(), "Show status".into()),
+        binding("v".into(), "Expand activity".into()),
         binding("q / Ctrl-C".into(), "Quit".into()),
     ]);
     let area = popup(frame, 54, lines.len() as u16 + 2);
@@ -748,65 +749,189 @@ fn sidebar_areas(area: Rect) -> (Rect, Rect) {
         ),
     )
 }
-pub fn draw_activity(frame: &mut Frame, area: Rect, events: &[String], scroll: usize) {
-    let end = events
-        .len()
-        .saturating_sub(scroll.min(events.len().saturating_sub(1)));
-    if area.height <= 1 {
-        frame.render_widget(
-            Paragraph::new(
-                events
-                    .get(end.saturating_sub(1))
-                    .map_or("No activity yet", String::as_str),
-            )
-            .style(Style::default().fg(TICKET_MUTED)),
-            area,
-        );
-        return;
-    }
-    let block = Block::bordered()
-        .title(" Activity ")
-        .border_style(Style::default().fg(TICKET_MUTED))
-        .padding(Padding::horizontal(1));
-    let count = area.height.saturating_sub(2) as usize;
-    let width = block.inner(area).width.max(1) as usize;
-    let mut wrapped = Vec::new();
-    for event in &events[..end] {
-        let (timestamp, message) = event.split_once("  ").unwrap_or(("", event.as_str()));
-        if !timestamp.is_empty() {
-            wrapped.push(timestamp.to_owned());
-        }
+fn activity_failed(event: &str) -> bool {
+    event
+        .split_once("  ")
+        .map_or(event, |(_, message)| message)
+        .starts_with("FAILED\n")
+}
+
+fn wrap_activity_text(text: &str, width: usize, prefix: &str, style: Style) -> Vec<Line<'static>> {
+    let available = width.saturating_sub(Line::raw(prefix).width()).max(1);
+    let mut lines = Vec::new();
+    for paragraph in text.lines() {
         let mut line = String::new();
-        for word in message.split_whitespace() {
-            if !line.is_empty() && Line::raw(format!("{line} {word}")).width() > width {
-                wrapped.push(std::mem::take(&mut line));
-            }
-            if !line.is_empty() {
-                line.push(' ');
+        for word in paragraph.split_inclusive(' ') {
+            if !line.trim().is_empty()
+                && Line::raw(format!("{line}{}", word.trim_end())).width() > available
+            {
+                lines.push(Line::styled(format!("{prefix}{}", line.trim_end()), style));
+                line.clear();
             }
             for c in word.chars() {
-                if Line::raw(format!("{line}{c}")).width() > width && !line.is_empty() {
-                    wrapped.push(std::mem::take(&mut line));
+                if Line::raw(format!("{line}{c}")).width() > available && !line.is_empty() {
+                    lines.push(Line::styled(format!("{prefix}{line}"), style));
+                    line.clear();
+                    if c == ' ' {
+                        continue;
+                    }
                 }
                 line.push(c);
             }
         }
-        if !line.is_empty() {
-            wrapped.push(line);
+        lines.push(Line::styled(format!("{prefix}{}", line.trim_end()), style));
+    }
+    lines
+}
+
+fn activity_entry(event: &str, width: usize, expanded: bool) -> Vec<Line<'static>> {
+    let failed = activity_failed(event);
+    let (timestamp, message) = event.split_once("  ").unwrap_or(("", event));
+    let (label, accent, message) = if let Some(message) = message.strip_prefix("FAILED\n") {
+        ("FAILED  ", Color::LightRed, message)
+    } else if let Some(message) = message.strip_prefix("DONE\n") {
+        ("DONE    ", Color::LightGreen, message)
+    } else {
+        ("INFO    ", TICKET_ACCENT, message)
+    };
+    let (summary, output) = message.split_once('\n').unwrap_or((message, ""));
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            label,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(timestamp.to_owned(), Style::default().fg(TICKET_MUTED)),
+    ])];
+    lines.extend(wrap_activity_text(
+        summary,
+        width,
+        "",
+        Style::default()
+            .fg(if failed { Color::LightRed } else { TICKET_TEXT })
+            .add_modifier(Modifier::BOLD),
+    ));
+    if !output.is_empty() {
+        if expanded {
+            lines.push(Line::default());
         }
+        lines.extend(wrap_activity_text(
+            output,
+            width,
+            if expanded { "│ " } else { "" },
+            Style::default().fg(TICKET_TEXT),
+        ));
     }
-    if wrapped.is_empty() {
-        wrapped.push("No activity yet".into());
+    lines
+}
+
+fn activity_lines(events: &[String], width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for event in events {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+            lines.push(Line::styled(
+                "─".repeat(width),
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::default());
+        }
+        lines.extend(activity_entry(event, width, true));
     }
-    let lines: Vec<Line> = wrapped[wrapped.len().saturating_sub(count)..]
-        .iter()
-        .map(|s| Line::raw(s.as_str()))
-        .collect();
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            "No activity yet",
+            Style::default().fg(TICKET_MUTED),
+        ));
+    }
+    lines
+}
+
+pub fn draw_activity(frame: &mut Frame, area: Rect, events: &[String], scroll: usize) {
+    let end = events
+        .len()
+        .saturating_sub(scroll.min(events.len().saturating_sub(1)));
+    let failed = events
+        .get(end.saturating_sub(1))
+        .is_some_and(|event| activity_failed(event));
+    let color = if failed {
+        Color::LightRed
+    } else {
+        TICKET_MUTED
+    };
+    let block = Block::bordered()
+        .title(if failed {
+            " Activity · FAILED "
+        } else {
+            " Activity "
+        })
+        .title_bottom(if events.is_empty() {
+            " v expand ".to_owned()
+        } else {
+            format!(" v expand · {end}/{} ", events.len())
+        })
+        .border_style(Style::default().fg(color))
+        .padding(Padding::horizontal(1));
+    let inner = if area.height <= 1 {
+        area
+    } else {
+        block.inner(area)
+    };
+    let mut lines = events.get(end.saturating_sub(1)).map_or_else(
+        || {
+            vec![Line::styled(
+                "No activity yet",
+                Style::default().fg(TICKET_MUTED),
+            )]
+        },
+        |event| activity_entry(event, inner.width as usize, false),
+    );
+    let count = inner.height as usize;
+    if lines.len() > count && count > 0 {
+        lines.truncate(count);
+        lines[count - 1] = Line::styled("… v for full output", Style::default().fg(TICKET_MUTED));
+    }
+    if area.height > 1 {
+        frame.render_widget(block, area);
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn activity_popup_area(area: Rect) -> Rect {
+    area.centered(
+        Constraint::Length(100),
+        Constraint::Length(area.height.saturating_sub(4).max(3)),
+    )
+}
+
+pub fn activity_scroll_limit(area: Rect, events: &[String]) -> usize {
+    let area = activity_popup_area(area);
+    activity_lines(events, area.width.saturating_sub(4) as usize)
+        .len()
+        .saturating_sub(area.height.saturating_sub(2) as usize)
+}
+
+pub fn activity_popup(frame: &mut Frame, ticket: &str, events: &[String], scroll: usize) {
+    let area = activity_popup_area(frame.area());
+    let block = Block::bordered()
+        .title(format!(" Activity · {ticket} "))
+        .title_bottom(" ↑↓ scroll · PgUp/PgDn · Home/End · Esc close ")
+        .border_style(Style::default().fg(Color::Cyan))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    let lines = activity_lines(events, inner.width as usize);
+    let limit = lines.len().saturating_sub(inner.height as usize);
+    let start = limit.saturating_sub(scroll.min(limit));
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
     frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().fg(TICKET_MUTED))
-            .block(block),
-        area,
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(start)
+                .take(inner.height as usize)
+                .collect::<Vec<_>>(),
+        ),
+        inner,
     );
 }
 

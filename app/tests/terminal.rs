@@ -55,6 +55,12 @@ fn fixture() -> tempfile::TempDir {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
+    let output = Command::new("jj")
+        .current_dir(temp.path().join("repo"))
+        .args(["bookmark", "create", "main"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
     let dir = temp.path().join("mentat");
     fs::create_dir(&dir).unwrap();
     let config = dir.join("config.toml");

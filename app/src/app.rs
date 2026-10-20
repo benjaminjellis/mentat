@@ -73,6 +73,8 @@ struct App {
     editing: Option<String>,
     activity: HashMap<String, Vec<String>>,
     activity_scroll: usize,
+    activity_popup: bool,
+    activity_popup_scroll: usize,
     overview_scroll: u16,
     next_refresh: Instant,
     next_cleanup: Instant,
@@ -116,6 +118,8 @@ pub fn run(config: Config) -> Result<()> {
         editing: None,
         activity: HashMap::new(),
         activity_scroll: 0,
+        activity_popup: false,
+        activity_popup_scroll: 0,
         overview_scroll: 0,
         next_refresh: Instant::now() + Duration::from_secs(60),
         next_cleanup: Instant::now(),
@@ -171,7 +175,11 @@ impl App {
 
     /// Whether a popup owns the keyboard, so children must not receive input.
     fn modal_open(&self) -> bool {
-        self.help || self.status || self.quit_prompt || self.linear.picker.is_some()
+        self.help
+            || self.status
+            || self.activity_popup
+            || self.quit_prompt
+            || self.linear.picker.is_some()
     }
 
     /// The view to show when focus leaves the sidebar: the ticket's own pane
@@ -321,8 +329,8 @@ impl App {
         self.pushes.retain(|id, push| {
             let message = match push.poll() {
                 Ok(None) => return true,
-                Ok(Some(message)) => message,
-                Err(error) => format!("{error:#}"),
+                Ok(Some(message)) => format!("DONE\n{message}"),
+                Err(error) => format!("FAILED\n{error:#}"),
             };
             self.notice = message.clone();
             record_event(&mut self.activity, id.clone(), message);
@@ -338,7 +346,7 @@ impl App {
             match result {
                 Ok(result) => {
                     if result.submitted {
-                        self.record(id.clone(), "Saved to Linear.".into());
+                        self.record(id.clone(), "DONE\nSaved to Linear.".into());
                     }
                     let form = self.forms.entry(id).or_default();
                     if let Some(details) = result.details {
@@ -369,6 +377,7 @@ impl App {
                     }
                 }
                 Err(error) => {
+                    self.record(id.clone(), format!("FAILED\n{error}"));
                     let form = self.forms.entry(id).or_default();
                     form.busy = false;
                     form.message = error;
@@ -414,8 +423,8 @@ impl App {
             Ok(None) => true,
             result => {
                 let message = match result {
-                    Ok(Some(status)) if status.success() => "Opened issue in Linear.".into(),
-                    _ => "Could not open Linear. Check your system's default browser or URL handler."
+                    Ok(Some(status)) if status.success() => "DONE\nOpened issue in Linear.".into(),
+                    _ => "FAILED\nCould not open Linear.\nCheck your system's default browser or URL handler."
                         .into(),
                 };
                 record_event(&mut self.activity, id.clone(), message);
@@ -467,7 +476,7 @@ impl App {
                 }
                 Err(error) => {
                     crate::logging::failure("agent_startup", &error);
-                    *notice = format!("Agent startup failed: {error:#}");
+                    *notice = format!("FAILED\nAgent startup failed:\n{error:#}");
                     record_event(activity, id.clone(), notice.clone());
                     if visible {
                         *current_view = View::Manager;
@@ -505,7 +514,7 @@ impl App {
             }
             if let Err(error) = session.deliver_paste(visible && *current_view == View::Primary) {
                 crate::logging::failure("ticket_paste", &error);
-                *notice = error.to_string();
+                *notice = format!("FAILED\n{error}");
                 record_event(activity, id.clone(), notice.clone());
                 *current_view = View::Manager;
                 redraw = true;
@@ -546,7 +555,7 @@ impl App {
                 }
                 Err(error) => {
                     crate::logging::failure("workspace_cleanup", &error);
-                    self.notice = format!("Workspace cleanup deferred: {error:#}");
+                    self.notice = format!("FAILED\nWorkspace cleanup deferred:\n{error:#}");
                 }
             }
             self.record(record.ticket_id.clone(), self.notice.clone());
@@ -633,7 +642,7 @@ impl App {
             .and_then(|s| s.child(pane_view))
             .filter(|_| !(pane_view == View::Primary && starting.is_some()));
         let Some(child) = child else {
-            let mut text = ui::details(display, &self.notice);
+            let mut text = ui::details(display, "");
             if let Some(issue) = self.linear.issue() {
                 let form = self.forms.get(&issue.id);
                 let details = form.and_then(|form| form.details.as_ref());
@@ -719,6 +728,16 @@ impl App {
         if self.status {
             ui::status_popup(frame, self.status_text());
         }
+        if self.activity_popup {
+            ui::activity_popup(
+                frame,
+                self.linear
+                    .issue()
+                    .map_or("", |issue| issue.identifier.as_str()),
+                self.activity_events(),
+                self.activity_popup_scroll,
+            );
+        }
         if self.quit_prompt {
             ui::quit_popup(frame);
         }
@@ -744,6 +763,19 @@ impl App {
         )
     }
 
+    fn activity_events(&self) -> &[String] {
+        self.editing
+            .as_deref()
+            .or_else(|| self.linear.issue().map(|issue| issue.id.as_str()))
+            .and_then(|id| self.activity.get(id))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn open_activity(&mut self) {
+        self.activity_popup = true;
+        self.activity_popup_scroll = 0;
+    }
+
     fn request_quit(&mut self) -> bool {
         if self.sessions.values().any(TicketSession::protected) {
             self.quit_prompt = true;
@@ -761,6 +793,30 @@ impl App {
         }
         if self.linear.picker.is_some() {
             self.key_picker(key);
+        } else if self.activity_popup {
+            let limit =
+                ui::activity_scroll_limit(Rect::new(0, 0, size.0, size.1), self.activity_events());
+            self.activity_popup_scroll = self.activity_popup_scroll.min(limit);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('v' | 'q') => self.activity_popup = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.activity_popup_scroll =
+                        self.activity_popup_scroll.saturating_add(1).min(limit);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.activity_popup_scroll = self.activity_popup_scroll.saturating_sub(1);
+                }
+                KeyCode::PageUp => {
+                    self.activity_popup_scroll =
+                        self.activity_popup_scroll.saturating_add(10).min(limit);
+                }
+                KeyCode::PageDown => {
+                    self.activity_popup_scroll = self.activity_popup_scroll.saturating_sub(10);
+                }
+                KeyCode::Home => self.activity_popup_scroll = limit,
+                KeyCode::End => self.activity_popup_scroll = 0,
+                _ => {}
+            }
         } else if self.status {
             self.status = !matches!(key.code, KeyCode::Esc | KeyCode::Char('s'));
         } else if self.help {
@@ -860,6 +916,7 @@ impl App {
             }
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('s') => self.status = true,
+            KeyCode::Char('v') => self.open_activity(),
             KeyCode::Char('l') => self.linear.open_picker(),
             KeyCode::Char('r') => {
                 self.linear.start(false);
@@ -988,7 +1045,7 @@ impl App {
             .cwd;
         crate::workspace::create_bookmark(directory, name)?;
         self.notice = format!(
-            "Set bookmark {name} at @ in {} and track it on origin.",
+            "DONE\nSet bookmark {name}\nAt @ in {}; tracking origin.",
             issue.identifier
         );
         self.record(issue.id, self.notice.clone());
@@ -1028,6 +1085,10 @@ impl App {
                 }
                 MouseEventKind::ScrollDown => {
                     self.activity_scroll = self.activity_scroll.saturating_sub(1)
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.open_activity();
+                    return Ok(MouseOutcome::redraw());
                 }
                 _ => {}
             }
@@ -1178,13 +1239,32 @@ impl App {
                         Ok(false) => {}
                         Err(error) => {
                             crate::logging::failure("ui_action", &error);
-                            if let Some(id) = self.current.clone() {
-                                self.record(id, format!("{error:#}"));
+                            if let Some(id) = self
+                                .linear
+                                .issue()
+                                .map(|issue| issue.id.clone())
+                                .or_else(|| self.current.clone())
+                            {
+                                self.record(id, format!("FAILED\n{error:#}"));
                             } else {
                                 self.notice = format!("{error:#}");
                             }
                             self.view = View::Manager;
                         }
+                    }
+                }
+                Event::Mouse(mouse) if self.activity_popup => {
+                    let key = match mouse.kind {
+                        MouseEventKind::ScrollUp => Some(KeyCode::Up),
+                        MouseEventKind::ScrollDown => Some(KeyCode::Down),
+                        _ => None,
+                    };
+                    if let Some(key) = key {
+                        let Some(size) = host_io(terminal::size())? else {
+                            return Ok(());
+                        };
+                        self.key(KeyEvent::new(key, KeyModifiers::NONE), size)?;
+                        redraw = true;
                     }
                 }
                 Event::Mouse(mouse) if !self.modal_open() => {

@@ -194,7 +194,7 @@ impl Workspaces {
                             "--name",
                             &record.name,
                             "-r",
-                            "@",
+                            "main",
                             destination,
                         ],
                     )?;
@@ -576,8 +576,8 @@ impl Push {
         self.output.rewind()?;
         let mut output = String::new();
         self.output.read_to_string(&mut output)?;
-        ensure!(status.success(), "jj git push failed: {}", output.trim());
-        Ok(Some(format!("jj git push completed. {}", output.trim())))
+        ensure!(status.success(), "jj git push failed:\n{}", output.trim());
+        Ok(Some(format!("jj git push completed.\n{}", output.trim())))
     }
 }
 
@@ -601,6 +601,7 @@ mod tests {
             &["git", "init", "--no-colocate", repo.to_str().unwrap()],
         )
         .unwrap();
+        jj(&repo, &["bookmark", "create", "main"]).unwrap();
         jj(
             &repo,
             &[
@@ -701,6 +702,7 @@ mod tests {
             &["git", "init", "--no-colocate", repo.to_str().unwrap()],
         )
         .unwrap();
+        jj(&repo, &["bookmark", "create", "main"]).unwrap();
         let checkouts = temp.path().join("checkouts");
         let workspaces = Workspaces::open(
             &repo,
@@ -779,6 +781,7 @@ mod tests {
         )
         .unwrap();
         jj(&repo, &["git", "init", "--colocate"]).unwrap();
+        jj(&repo, &["bookmark", "set", "main", "-r", "@"]).unwrap();
         let state = temp.path().join("state");
         let checkouts = temp.path().join("checkouts");
         let jj_store =
@@ -810,6 +813,7 @@ mod tests {
             &["git", "init", "--no-colocate", repo.to_str().unwrap()],
         )
         .unwrap();
+        jj(&repo, &["bookmark", "create", "main"]).unwrap();
         let store = Workspaces::open(&repo, &state, Some(&root), WorkspaceKind::Jj).unwrap();
         let stored = state.join("workspaces/repo-TEST-1");
         store
@@ -838,6 +842,7 @@ mod tests {
             &["git", "init", "--no-colocate", other.to_str().unwrap()],
         )
         .unwrap();
+        jj(&other, &["bookmark", "create", "main"]).unwrap();
         let other = Workspaces::open(&other, &state, Some(&root), WorkspaceKind::Jj).unwrap();
         let second = other.ensure("one", "TEST-1").unwrap();
         assert_eq!(first.path, root.join("TEST-1"));
@@ -864,6 +869,7 @@ mod tests {
                     &["git", "init", "--no-colocate", repo.to_str().unwrap()],
                 )
                 .unwrap();
+                jj(&repo, &["bookmark", "create", "main"]).unwrap();
             }
             WorkspaceKind::Git => {
                 git(temp.path(), &["init", repo.to_str().unwrap()]).unwrap();
