@@ -534,6 +534,11 @@ fn jj(directory: &Path, args: &[&str]) -> Result<String> {
     vcs(&JJ, directory, args)
 }
 
+pub fn describe(directory: &Path, description: &str) -> Result<()> {
+    jj(directory, &["describe", "@", "--message", description])?;
+    Ok(())
+}
+
 pub fn create_bookmark(directory: &Path, name: &str) -> Result<()> {
     jj(
         directory,

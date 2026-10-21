@@ -88,7 +88,7 @@ impl Cli {
                 }
                 Some("--help" | "-h") => {
                     println!(
-                        "Mentat: live terminal views\n\nUsage: mentat [--codex | --claude | --shell | --editor] [--cwd PATH] [--escape ctrl-g] [--resume ID | --new-conversation] [-- COMMAND ARGS...]\n\nDefault: resume the selected ticket conversation.\na: open agent. Enter: open agent and send it the ticket. e: configured editor. t: shell. o: open issue in Linear. Ctrl-G: sidebar. l: choose Linear workspace. ?: help.\nQuit offers a force option when an editor or shell remains open."
+                        "Mentat: live terminal views\n\nUsage: mentat [--codex | --claude | --shell | --editor] [--cwd PATH] [--escape ctrl-g] [--resume ID | --new-conversation] [-- COMMAND ARGS...]\n\nDefault: resume the selected ticket conversation.\na: open agent. Enter: open agent and send it the ticket. e: configured editor. t: shell. o: open issue in Linear. d: set jj description from Linear. Ctrl-G: sidebar. l: choose Linear workspace. ?: help.\nQuit offers a force option when an editor or shell remains open."
                     );
                     return Ok(None);
                 }

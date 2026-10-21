@@ -870,6 +870,7 @@ impl App {
 
             KeyCode::Char('o') => self.open_in_linear()?,
             KeyCode::Char('b') => self.create_bookmark()?,
+            KeyCode::Char('d') => self.describe_ticket()?,
             KeyCode::Char('p') => self.push_ticket()?,
             KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up
                 if self.view == View::Overview =>
@@ -960,6 +961,32 @@ impl App {
         let push = crate::workspace::Push::start(directory)?;
         self.pushes.insert(issue.id.clone(), push);
         self.notice = format!("Started jj git push for {}.", issue.identifier);
+        self.record(issue.id, self.notice.clone());
+        Ok(())
+    }
+
+    fn describe_ticket(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.config.workspace == crate::settings::WorkspaceKind::Jj,
+            "Linear descriptions require the jj workspace backend"
+        );
+
+        let issue = self
+            .linear
+            .issue()
+            .context("Select a Linear ticket first")?
+            .clone();
+
+        self.ensure_session(&issue)?;
+        let directory = &self
+            .sessions
+            .get(&issue.id)
+            .expect("ticket session exists")
+            .config
+            .cwd;
+        let description = format!("[{}] {}", issue.identifier, issue.title);
+        crate::workspace::describe(directory, &description)?;
+        self.notice = format!("Set description at @ to {description}");
         self.record(issue.id, self.notice.clone());
         Ok(())
     }
