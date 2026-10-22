@@ -270,6 +270,32 @@ fn opens_selected_linear_issue_and_reports_opener_errors() {
 }
 
 #[test]
+fn describe_shortcut_uses_the_selected_linear_ticket_workspace() {
+    let temp = fixture();
+    let mut host = start(&temp);
+    wait_for(&host, "TEST-1");
+    host.write(b"jd").unwrap();
+    wait_for(&host, "Set description at @ to [TEST-2] Ticket 2");
+
+    let description = |directory| {
+        let output = Command::new("jj")
+            .current_dir(directory)
+            .args(["log", "--no-graph", "-r", "@", "-T", "description"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(
+        description(temp.path().join("checkouts/TEST-2")),
+        "[TEST-2] Ticket 2\n"
+    );
+    assert_eq!(description(temp.path().join("repo")), "");
+    assert!(!temp.path().join("checkouts/TEST-1").exists());
+    quit(&mut host, false);
+}
+
+#[test]
 fn push_shortcut_reports_errors_for_the_selected_ticket() {
     let temp = fixture();
     // Empty pushes and config discovery vary between jj versions/platforms.
