@@ -1,13 +1,15 @@
 mod terminal_view;
+mod text_selection;
 
 pub use terminal_view::{TerminalSelection, TerminalView};
+pub use text_selection::TextSelection;
 
 use ratatui::{
     Frame,
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Padding, Paragraph, Widget, Wrap},
 };
 use std::time::Duration;
 
@@ -24,9 +26,15 @@ pub struct Ticket<'a> {
 pub struct Tickets<'a> {
     pub items: &'a [Ticket<'a>],
     pub selected: usize,
-    pub connected: bool,
     /// Elapsed time in the current Linear operation, which also drives the spinner.
     pub busy: Option<Duration>,
+    pub search: Option<Search<'a>>,
+    pub status_filter: Option<&'a str>,
+}
+
+pub struct Search<'a> {
+    pub query: &'a str,
+    pub active: bool,
 }
 
 impl<'a> Tickets<'a> {
@@ -134,13 +142,24 @@ pub fn draw(
         ])),
         areas.header,
     );
-    if areas.sidebar.width > 0 {
+    if areas.sidebar.width == 0 {
+        if let Some(search) = &linear.search {
+            draw_search(frame, areas.header, search);
+        } else if let Some(status) = linear.status_filter {
+            frame.render_widget(Paragraph::new(format!("Status: {status}")), areas.header);
+        }
+    } else {
         let refresh_title = linear
             .busy
             .map_or_else(String::new, |elapsed| format!(" {} ", spinner(elapsed)));
         let block = Block::bordered()
             .title(" Workspace ")
             .title(Line::from(refresh_title).right_aligned())
+            .title_bottom(match &linear.search {
+                Some(search) if search.active => " Enter apply · Esc clear ",
+                Some(_) => " / edit · Esc clear ",
+                None => " / search · S status ",
+            })
             .border_style(if focused {
                 Style::default()
                     .fg(Color::Cyan)
@@ -148,8 +167,34 @@ pub fn draw(
             } else {
                 Style::default().fg(Color::DarkGray)
             });
-        let inner = block.inner(areas.sidebar);
+        let mut inner = block.inner(areas.sidebar);
         frame.render_widget(block, areas.sidebar);
+        if let Some(status) = linear.status_filter {
+            let height = inner.height.min(1);
+            frame.render_widget(
+                Paragraph::new(format!("Status: {status}"))
+                    .style(Style::default().fg(TICKET_STATUS)),
+                Rect::new(inner.x, inner.y, inner.width, height),
+            );
+            inner.y += height;
+            inner.height -= height;
+        }
+        if let Some(search) = &linear.search {
+            let height = inner.height.min(1);
+            draw_search(
+                frame,
+                Rect::new(inner.x, inner.y, inner.width, height),
+                search,
+            );
+            inner.y += height;
+            inner.height -= height;
+        }
+        if linear.items.is_empty() && (linear.search.is_some() || linear.status_filter.is_some()) {
+            frame.render_widget(
+                Paragraph::new("No matching tickets.").style(Style::default().fg(TICKET_MUTED)),
+                inner,
+            );
+        }
         let items: Vec<_> = linear
             .items
             .iter()
@@ -200,9 +245,31 @@ pub fn draw(
     areas.content
 }
 
-pub fn details<'a>(linear: &Tickets<'a>, notice: &'a str) -> Text<'a> {
+fn draw_search(frame: &mut Frame, area: Rect, search: &Search<'_>) {
+    if area.is_empty() {
+        return;
+    }
+    let text = Line::raw(format!("/ {}", search.query));
+    let width = text.width();
+    let offset = width.saturating_sub(usize::from(area.width.saturating_sub(1)));
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().fg(if search.active {
+                Color::Cyan
+            } else {
+                TICKET_MUTED
+            }))
+            .scroll((0, offset.min(usize::from(u16::MAX)) as u16)),
+        area,
+    );
+    if search.active {
+        frame.set_cursor_position((area.x + (width - offset) as u16, area.y));
+    }
+}
+
+pub fn details<'a>(issue: Option<&Ticket<'a>>) -> Text<'a> {
     let muted = Style::default().fg(TICKET_MUTED);
-    let mut text = if let Some(issue) = linear.issue() {
+    if let Some(issue) = issue {
         let mut lines = vec![
             Line::from(Span::styled(
                 issue.identifier,
@@ -233,38 +300,17 @@ pub fn details<'a>(linear: &Tickets<'a>, notice: &'a str) -> Text<'a> {
             )),
             Line::default(),
         ];
-        let description = issue.description.filter(|s| !s.trim().is_empty());
-        let style = if description.is_some() {
-            Style::default().fg(TICKET_TEXT)
-        } else {
-            muted
-        };
         lines.extend(
-            description
-                .unwrap_or("No description.")
+            issue
+                .description
+                .unwrap_or_default()
                 .lines()
-                .map(|line| Line::from(Span::styled(line, style))),
+                .map(|line| Line::from(Span::styled(line, Style::default().fg(TICKET_TEXT)))),
         );
         Text::from(lines)
-    } else if linear.busy.is_some() {
-        Text::styled("Loading Linear issues…", muted)
-    } else if linear.connected {
-        Text::styled(
-            "No assigned Linear tickets.\n\nSelect a ticket when the list contains issues.",
-            muted,
-        )
     } else {
-        Text::styled("Connect Linear to get started", muted)
-    };
-    if !notice.is_empty() {
-        text.lines.push(Line::default());
-        text.lines.extend(
-            notice
-                .lines()
-                .map(|line| Line::from(Span::styled(line, Style::default().fg(TICKET_ACCENT)))),
-        );
+        Text::default()
     }
-    text
 }
 
 pub struct Comment<'a> {
@@ -273,7 +319,7 @@ pub struct Comment<'a> {
     pub body: &'a str,
 }
 
-pub fn append_comments(text: &mut Text<'_>, comments: &[Comment<'_>], status: Option<&str>) {
+pub fn append_comments(text: &mut Text<'_>, comments: &[Comment<'_>]) {
     text.lines.push(Line::default());
     text.lines.push(Line::styled(
         format!("COMMENTS ({})", comments.len()),
@@ -294,21 +340,39 @@ pub fn append_comments(text: &mut Text<'_>, comments: &[Comment<'_>], status: Op
             .extend(comment.body.lines().map(|line| Line::raw(line.to_owned())));
         text.lines.push(Line::default());
     }
-    if let Some(message) = status {
-        text.lines.push(Line::styled(
-            message.to_owned(),
-            Style::default().fg(TICKET_MUTED),
-        ));
-    } else if comments.is_empty() {
-        text.lines.push(Line::styled(
-            "No comments yet.",
-            Style::default().fg(TICKET_MUTED),
-        ));
-    }
-    text.lines.push(Line::styled(
-        "i open · e edit ticket · ↑↓ scroll",
-        Style::default().fg(TICKET_MUTED),
-    ));
+}
+
+fn details_block(focused: bool) -> Block<'static> {
+    Block::bordered()
+        .title(" Ticket overview ")
+        .border_style(if focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TICKET_MUTED)
+        })
+        .padding(Padding::horizontal(1))
+}
+
+pub fn details_area(area: Rect) -> Rect {
+    details_block(false).inner(area)
+}
+
+pub fn select_details(
+    text: Text<'_>,
+    area: Rect,
+    scroll: u16,
+    row: u16,
+    col: u16,
+) -> TextSelection {
+    let area = Rect::new(0, 0, area.width, area.height);
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    Paragraph::new(text)
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false })
+        .render(area, &mut buffer);
+    TextSelection::new(buffer, row, col)
 }
 
 pub fn draw_details(
@@ -316,43 +380,22 @@ pub fn draw_details(
     area: Rect,
     text: Text<'_>,
     focused: bool,
-    starting: Option<(&str, Duration)>,
     scroll: u16,
+    selection: Option<&TextSelection>,
 ) {
-    let startup_title = starting.map_or_else(String::new, |(agent, elapsed)| {
-        format!(" Starting {agent}… {} ", spinner(elapsed))
-    });
-    frame.render_widget(
-        Paragraph::new(text)
-            .scroll((scroll, 0))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::bordered()
-                    .title(" Ticket overview ")
-                    .title_bottom(Line::from(vec![
-                        Span::styled(" i", Style::default().fg(Color::Cyan)),
-                        Span::raw(" edit · "),
-                        Span::styled("?", Style::default().fg(Color::Cyan)),
-                        Span::raw(" help "),
-                    ]))
-                    .title(
-                        Line::from(Span::styled(
-                            startup_title,
-                            Style::default().fg(Color::Cyan),
-                        ))
-                        .right_aligned(),
-                    )
-                    .border_style(if focused {
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(TICKET_MUTED)
-                    })
-                    .padding(Padding::horizontal(1)),
-            ),
-        area,
-    );
+    let block = details_block(focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if let Some(selection) = selection {
+        frame.render_widget(selection, inner);
+    } else {
+        frame.render_widget(
+            Paragraph::new(text)
+                .scroll((scroll, 0))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
 }
 
 pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool) {
@@ -374,9 +417,9 @@ pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool
         binding("d".into(), "Linear description (jj)".into()),
         binding("p".into(), "Push (jj git push)".into()),
         heading("  NAVIGATION"),
-        binding("j/k · ↑/↓".into(), "Select issue".into()),
+        binding("j/k · ↑/↓".into(), "Select · / search".into()),
         binding("f".into(), "Sidebar / full screen".into()),
-        binding("Drag".into(), "Copy output from sidebar focus".into()),
+        binding("Ctrl-C/V".into(), "Copy selection / paste".into()),
         binding(
             format!("Ctrl-{}", escape.to_ascii_uppercase()),
             "Return to manager".into(),
@@ -392,8 +435,8 @@ pub fn help(frame: &mut Frame, escape: char, editor: &str, pane_navigation: bool
         heading("  LINEAR & APP"),
         binding("l".into(), "Choose Linear workspace".into()),
         binding("r".into(), "Refresh issues".into()),
-        binding("s".into(), "Show status".into()),
-        binding("q / Ctrl-C".into(), "Quit".into()),
+        binding("s / S".into(), "App status / filter".into()),
+        binding("q".into(), "Quit".into()),
     ]);
     let area = popup(frame, 54, lines.len() as u16 + 2);
     frame.render_widget(
@@ -500,6 +543,31 @@ pub fn workspace_picker(frame: &mut Frame, picker: WorkspacePicker<'_>) {
     );
 }
 
+pub fn status_filter(frame: &mut Frame, statuses: &[String], selected: usize) {
+    let height = statuses.len().saturating_add(3).min(18) as u16;
+    let area = popup(frame, 48, height);
+    let items = std::iter::once(ListItem::new("All statuses"))
+        .chain(statuses.iter().map(|status| ListItem::new(status.as_str())));
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::bordered()
+                    .title(" Filter by status ")
+                    .title_bottom(" ↑↓ select · Enter apply · Esc cancel ")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .highlight_symbol("› ")
+            .highlight_style(
+                Style::default()
+                    .bg(TICKET_SELECTED)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        area,
+        &mut state,
+    );
+}
+
 pub fn status_popup(frame: &mut Frame, text: String) {
     let area = popup(frame, 76, 18);
     frame.render_widget(
@@ -554,8 +622,9 @@ mod tests {
             let tickets = Tickets {
                 items: &items,
                 selected,
-                connected: true,
                 busy: None,
+                search: None,
+                status_filter: None,
             };
             let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
             terminal
@@ -709,20 +778,18 @@ mod tests {
         let tickets = Tickets {
             items: &[],
             selected: 0,
-            connected: false,
             busy: None,
+            search: None,
+            status_filter: None,
         };
-        assert_eq!(
-            details(&tickets, "").to_string(),
-            "Connect Linear to get started"
-        );
+        assert_eq!(details(None).to_string(), "");
         for width in [0, 40, 100] {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal
                 .draw(|frame| {
                     let content = draw(frame, &tickets, "/home/user/project", true, true);
                     assert_eq!(content.width, if width >= 70 { width - 28 } else { width });
-                    draw_details(frame, content, details(&tickets, ""), false, None, 0);
+                    draw_details(frame, content, details(None), false, 0, None);
                 })
                 .unwrap();
         }
@@ -750,16 +817,25 @@ fn sidebar_areas(area: Rect) -> (Rect, Rect) {
         ),
     )
 }
-pub fn draw_activity(frame: &mut Frame, area: Rect, events: &[String], scroll: usize) {
+pub fn draw_activity(
+    frame: &mut Frame,
+    area: Rect,
+    events: &[String],
+    scroll: usize,
+    starting: Option<(&str, Duration)>,
+) {
+    let startup =
+        starting.map(|(agent, elapsed)| format!("Starting {agent}… {}", spinner(elapsed)));
     let end = events
         .len()
         .saturating_sub(scroll.min(events.len().saturating_sub(1)));
     if area.height <= 1 {
         frame.render_widget(
             Paragraph::new(
-                events
-                    .get(end.saturating_sub(1))
-                    .map_or("No activity yet", String::as_str),
+                startup
+                    .as_deref()
+                    .or_else(|| events.get(end.saturating_sub(1)).map(String::as_str))
+                    .unwrap_or("No activity yet"),
             )
             .style(Style::default().fg(TICKET_MUTED)),
             area,
@@ -773,8 +849,12 @@ pub fn draw_activity(frame: &mut Frame, area: Rect, events: &[String], scroll: u
     let count = area.height.saturating_sub(2) as usize;
     let width = block.inner(area).width.max(1) as usize;
     let mut wrapped = Vec::new();
-    for event in &events[..end] {
-        let (timestamp, message) = event.split_once("  ").unwrap_or(("", event.as_str()));
+    for event in events[..end]
+        .iter()
+        .map(String::as_str)
+        .chain(startup.as_deref())
+    {
+        let (timestamp, message) = event.split_once("  ").unwrap_or(("", event));
         if !timestamp.is_empty() {
             wrapped.push(timestamp.to_owned());
         }
@@ -816,7 +896,7 @@ pub fn draw_activity(frame: &mut Frame, area: Rect, events: &[String], scroll: u
 mod activity_tests {
     use super::*;
     #[test]
-    fn comments_show_authors_bodies_and_empty_or_failed_states() {
+    fn comments_show_only_linear_content() {
         let mut text = Text::default();
         append_comments(
             &mut text,
@@ -825,7 +905,6 @@ mod activity_tests {
                 created_at: "2026-10-14",
                 body: "First line\nSecond line",
             }],
-            None,
         );
         let rendered = text.to_string();
         for expected in [
@@ -838,9 +917,8 @@ mod activity_tests {
             assert!(rendered.contains(expected));
         }
         let mut empty = Text::default();
-        append_comments(&mut empty, &[], Some("Comments unavailable"));
-        assert!(empty.to_string().contains("Comments unavailable"));
-        assert!(!empty.to_string().contains("No comments yet"));
+        append_comments(&mut empty, &[]);
+        assert_eq!(empty.to_string().trim(), "COMMENTS (0)");
     }
     #[test]
     fn activity_is_left_of_full_height_content_and_hides_with_sidebar() {

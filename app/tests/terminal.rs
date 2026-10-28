@@ -62,7 +62,7 @@ fn fixture() -> tempfile::TempDir {
     fs::set_permissions(config, fs::Permissions::from_mode(0o600)).unwrap();
     let issues: Vec<_> = (1..=2).map(|id| serde_json::json!({
         "id": format!("ticket-{id}"), "identifier": format!("TEST-{id}"), "title": format!("Ticket {id}"),
-        "description": "Body", "url": format!("https://linear.app/test/issue/TEST-{id}"), "state": {"name":"Started"}, "team":{"name":"Test"}
+        "description": "Body", "url": format!("https://linear.app/test/issue/TEST-{id}"), "state": {"name": if id == 1 { "Started" } else { "Todo" }}, "team":{"name":"Test"}
     })).collect();
     let snapshot: linear::Snapshot =
         serde_json::from_value(serde_json::json!({"viewer":"Test", "issues":issues})).unwrap();
@@ -204,6 +204,110 @@ fn pane_navigation_focuses_overview_before_any_tool_is_open() {
 }
 
 #[test]
+fn sidebar_search_filters_titles_and_numbers_without_triggering_shortcuts() {
+    let temp = fixture();
+    let mut host = start(&temp);
+    wait_for(&host, "https://linear.app/test/issue/TEST-1");
+    host.write(b"\x03").unwrap();
+    host.write(b"/tIcKeT 2").unwrap();
+    wait_for(&host, "/ tIcKeT 2");
+    wait_for(&host, "https://linear.app/test/issue/TEST-2");
+    assert!(
+        !host
+            .parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("TEST-1")
+    );
+    host.write(b"\r").unwrap();
+    wait_for(&host, "/ edit");
+    host.write(b"\x1b").unwrap();
+    wait_for(&host, "/ search");
+    host.write(b"/test-").unwrap();
+    wait_for(&host, "/ test-");
+    host.write(b"\x1b[A").unwrap();
+    wait_for(&host, "https://linear.app/test/issue/TEST-1");
+    host.write(b"\x1b[B2").unwrap();
+    wait_for(&host, "https://linear.app/test/issue/TEST-2");
+    host.write(b"\x7f\x1b[200~1\x1b[201~").unwrap();
+    wait_for(&host, "https://linear.app/test/issue/TEST-1");
+    host.write(b"qfj").unwrap();
+    wait_for(&host, "No matching tickets.");
+    host.write(b"\x1b").unwrap();
+    wait_for(&host, "https://linear.app/test/issue/TEST-1");
+    host.write(b"tprintf 'SLASH-%s\\n' /\r").unwrap();
+    wait_for(&host, "SLASH-/");
+    quit(&mut host, true);
+}
+
+#[test]
+fn status_filter_combines_with_search_and_supports_cancel_and_all_statuses() {
+    let temp = fixture();
+    let mut host = start(&temp);
+    let wait_closed = |host: &Session| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while host
+            .parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("Filter by status")
+        {
+            assert!(Instant::now() < deadline, "Status filter did not close");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_for(&host, "TEST-1");
+    host.write(b"S").unwrap();
+    wait_for(&host, "Filter by status");
+    host.write(b"jj\r").unwrap();
+    wait_for(&host, "Status: Todo");
+    wait_for(&host, "https://linear.app/test/issue/TEST-2");
+    assert!(
+        !host
+            .parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("TEST-1")
+    );
+
+    host.write(b"Sk").unwrap();
+    wait_for(&host, "Filter by status");
+    host.write(b"\x1b").unwrap();
+    wait_closed(&host);
+    wait_for(&host, "Status: Todo");
+    host.write(b"/1").unwrap();
+    wait_for(&host, "No matching tickets.");
+    host.write(b"\rS").unwrap();
+    wait_for(&host, "Filter by status");
+    host.write(b"k\r").unwrap();
+    wait_for(&host, "Status: Started");
+    wait_for(&host, "https://linear.app/test/issue/TEST-1");
+    host.write(b"S").unwrap();
+    wait_for(&host, "All statuses");
+    host.write(b"k\r").unwrap();
+    wait_closed(&host);
+    wait_for(&host, "/ edit");
+    assert!(
+        !host
+            .parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("Status: Started")
+    );
+    host.write(b"\x1b").unwrap();
+    wait_for(&host, "TEST-2");
+    quit(&mut host, false);
+}
+
+#[test]
 fn workspace_picker_opens_from_manager_and_escape_returns_to_tickets() {
     let temp = fixture();
     let mut host = start(&temp);
@@ -275,7 +379,8 @@ fn describe_shortcut_uses_the_selected_linear_ticket_workspace() {
     let mut host = start(&temp);
     wait_for(&host, "TEST-1");
     host.write(b"jd").unwrap();
-    wait_for(&host, "Set description at @ to [TEST-2] Ticket 2");
+    wait_for(&host, "Set description at @ to");
+    wait_for(&host, "[TEST-2] Ticket 2");
 
     let description = |directory| {
         let output = Command::new("jj")
@@ -452,6 +557,23 @@ fn dragging_output_copies_only_the_main_pane_and_preserves_paste() {
     }
     let temp = fixture();
     let capture = temp.path().join("agent-input");
+    let clipboard_path = temp.path().join("clipboard");
+    let clipboard_bin = temp.path().join("clipboard-bin");
+    fs::create_dir(&clipboard_bin).unwrap();
+    for (name, body) in [
+        ("pbcopy", "cat > \"$CLIPBOARD\""),
+        ("pbpaste", "cat \"$CLIPBOARD\""),
+        ("wl-copy", "cat > \"$CLIPBOARD\""),
+        ("wl-paste", "cat \"$CLIPBOARD\""),
+        (
+            "xclip",
+            "if [ \"$3\" = -o ]; then cat \"$CLIPBOARD\"; else cat > \"$CLIPBOARD\"; fi",
+        ),
+    ] {
+        let path = clipboard_bin.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let pair = portable_pty::native_pty_system()
         .openpty(portable_pty::PtySize {
             rows: 30,
@@ -467,6 +589,17 @@ fn dragging_output_copies_only_the_main_pane_and_preserves_paste() {
     command.env_remove("LINEAR_CLIENT_ID");
     command.env("TERM", "xterm-256color");
     command.env("CAPTURE", &capture);
+    command.env("CLIPBOARD", &clipboard_path);
+    command.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            clipboard_bin.display(),
+            std::env::var("PATH").unwrap()
+        ),
+    );
+    command.env_remove("SSH_TTY");
+    command.env_remove("SSH_CONNECTION");
     command.args(["--", "/bin/sh", "-c", "stty raw -echo; printf '\\033[?1002h\\033[?1006h\\033[?2004h\\033[2J\\033[Halpha\\r\\nbeta'; cat >> \"$CAPTURE\""]);
     let mut child = ChildGuard(pair.slave.spawn_command(command).unwrap());
     drop(pair.slave);
@@ -503,6 +636,21 @@ fn dragging_output_copies_only_the_main_pane_and_preserves_paste() {
         parser.screen().contents().contains(text)
     };
     wait(&|bytes| screen_contains(bytes, "TEST-1"));
+    writer
+        .write_all(b"\x1b[<0;31;4M\x1b[<32;38;4M\x1b[<0;38;4m")
+        .unwrap();
+    let overview_clipboard = format!(
+        "\x1b]52;c;{}\x1b\\",
+        base64::engine::general_purpose::STANDARD.encode("Ticket 1")
+    );
+    wait(&|bytes| {
+        bytes
+            .windows(overview_clipboard.len())
+            .any(|part| part == overview_clipboard.as_bytes())
+    });
+    fs::write(&clipboard_path, "replace this").unwrap();
+    writer.write_all(b"\x03").unwrap();
+    wait(&|_| fs::read_to_string(&clipboard_path).unwrap_or_default() == "Ticket 1");
     writer.write_all(b"\r").unwrap();
     wait(&|bytes| screen_contains(bytes, "beta"));
     writer.write_all(b"\x07").unwrap();
@@ -547,11 +695,12 @@ fn dragging_output_copies_only_the_main_pane_and_preserves_paste() {
             .windows(7)
             .filter(|part| *part == b"\x1b]52;c;")
             .count(),
-        2
+        4
     );
     // Refocus the tool and paste using the terminal's normal bracketed paste.
-    writer.write_all(b"\r\x1b[200~lpha\nbet\x1b[201~").unwrap();
-    wait(&|_| fs::read(&capture).unwrap_or_default() == b"\x1b[200~lpha\nbet\x1b[201~");
+    fs::write(&clipboard_path, "Ticket 1\nlpha\nbet").unwrap();
+    writer.write_all(b"\r\x16").unwrap();
+    wait(&|_| fs::read(&capture).unwrap_or_default() == b"\x1b[200~Ticket 1\nlpha\nbet\x1b[201~");
     writer.write_all(b"\x07q").unwrap();
     wait(&|bytes| screen_contains(bytes, "Force quit"));
     writer.write_all(b"f").unwrap();
@@ -780,10 +929,7 @@ fi
             thread::sleep(Duration::from_millis(20));
         }
         let first = host.parser.lock().unwrap().screen().contents();
-        assert!(
-            first.lines().nth(1).unwrap().contains("Starting codex"),
-            "Startup indicator should be in the panel header"
-        );
+        assert!(first.find("Starting codex").unwrap() > first.find("Activity").unwrap());
         assert!(
             first.contains("Body"),
             "Ticket overview should remain visible during startup"
@@ -882,10 +1028,10 @@ fn ticket_paste_only_seeds_new_agent_conversations() {
     host.write(b"\x7f\x1b[127u\x1b[13;2uAFTER\r").unwrap();
     expected.extend_from_slice(b"\x7f\x7f\x1b[13;2uAFTER\r");
     expect_input(&expected);
-    // A focused PTY owns shortcuts, including Mentat's pane and manager keys.
+    // A focused PTY owns pane and manager keys; Ctrl-C remains a copy shortcut.
     host.write(b"\x08\x0a\x0b\x0c\x1b[104;5u\x1b[108;5uqbes?\x03")
         .unwrap();
-    expected.extend_from_slice(b"\x08\x0a\x0b\x0c\x08\x0cqbes?\x03");
+    expected.extend_from_slice(b"\x08\x0a\x0b\x0c\x08\x0cqbes?");
     host.write(b"\x09\x1b[105;5u").unwrap();
     expected.extend_from_slice(b"\x09\x09");
     expect_input(&expected);
@@ -1052,7 +1198,6 @@ fn issue_form_keeps_text_local_and_activity_is_separate() {
     let mut host = start(&temp);
     wait_for(&host, "Ticket overview");
     wait_for(&host, "Activity");
-    wait_for(&host, "COMMENTS");
     {
         let parser = host.parser.lock().unwrap();
         let screen = parser.screen();
@@ -1063,7 +1208,6 @@ fn issue_form_keeps_text_local_and_activity_is_separate() {
         );
     }
     host.write(b"i").unwrap();
-    wait_for(&host, "e edit ticket");
     assert!(
         !host
             .parser
@@ -1092,6 +1236,27 @@ fn issue_form_keeps_text_local_and_activity_is_separate() {
     host.write(b"t").unwrap();
     host.write(b"exit\r").unwrap();
     wait_for(&host, "Shell exited");
+    let overview = host
+        .parser
+        .lock()
+        .unwrap()
+        .screen()
+        .rows(28, 72)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for message in [
+        "Shell exited",
+        "Terminal exited",
+        "sign in",
+        "Loading",
+        "edit ticket",
+        "help",
+    ] {
+        assert!(
+            !overview.contains(message),
+            "Unexpected overview message: {overview}"
+        );
+    }
     let screen = host.parser.lock().unwrap().screen().contents();
     assert!(screen.find("Activity").unwrap() < screen.find("Shell exited").unwrap());
     host.write(b"j").unwrap();

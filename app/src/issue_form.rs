@@ -318,7 +318,7 @@ impl Form {
             .details
             .as_ref()
             .and_then(|d| d.team.states.nodes.get(self.state))
-            .map_or("Loading…", |s| s.name.as_str());
+            .map_or("", |s| s.name.as_str());
         let priority =
             ["No priority", "Urgent", "High", "Medium", "Low"][usize::from(self.priority.min(4))];
         let fields: Vec<(&str, &str)> = if self.comments {
@@ -386,19 +386,11 @@ impl Form {
             lines.extend(display.lines().map(|s| Line::raw(format!("  {s}"))));
             lines.push(Line::default());
         }
-        let message_height = self
-            .message
-            .chars()
-            .count()
-            .max(1)
-            .div_ceil(inner.width.max(1) as usize)
-            .min(5) as u16;
-        let footer_height = (message_height + 1).min(inner.height.saturating_sub(1));
         let body = Rect::new(
             inner.x,
             inner.y,
             inner.width,
-            inner.height.saturating_sub(footer_height + 1),
+            inner.height.saturating_sub(2),
         );
         let scroll = self.scroll.unwrap_or_else(|| {
             focused_line
@@ -410,17 +402,6 @@ impl Form {
                 .wrap(Wrap { trim: false })
                 .scroll((scroll, 0)),
             body,
-        );
-        frame.render_widget(
-            Paragraph::new(self.message.as_str())
-                .style(accent)
-                .wrap(Wrap { trim: false }),
-            Rect::new(
-                inner.x,
-                inner.bottom().saturating_sub(footer_height),
-                inner.width,
-                footer_height.saturating_sub(1),
-            ),
         );
         let hint = if inner.width >= 42 {
             "Esc back · Tab focus · Ctrl-N tabs · Ctrl-↑↓ scroll"
@@ -485,5 +466,6 @@ mod tests {
             .collect();
         assert!(screen.contains("Save changes"));
         assert!(screen.contains("Esc back"));
+        assert!(!screen.contains(&form.message));
     }
 }

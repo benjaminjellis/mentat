@@ -1,6 +1,7 @@
 use ::linear::{Config, Issue, Progress, Snapshot, Store, SyncResult};
 use std::future::Future;
 use std::{
+    collections::BTreeSet,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -31,6 +32,8 @@ pub struct Linear {
     pub picker: Option<WorkspacePicker>,
     pub workspace: Option<::linear::Workspace>,
     pub selected: usize,
+    pub search_query: String,
+    pub status_filter: Option<String>,
     pub status: String,
     /// When the current operation started. `None` means idle; the UI animates
     /// from this instant rather than keeping a frame counter of its own.
@@ -72,6 +75,8 @@ impl Linear {
             picker: None,
             workspace,
             selected: 0,
+            search_query: String::new(),
+            status_filter: None,
             tracked,
             closed: Vec::new(),
             status: "Linear: not connected".into(),
@@ -99,7 +104,66 @@ impl Linear {
     }
 
     pub fn issue(&self) -> Option<&Issue> {
-        self.snapshot.as_ref()?.issues.get(self.selected)
+        self.issues().nth(self.selected)
+    }
+
+    pub fn issues(&self) -> impl Iterator<Item = &Issue> {
+        let query = self.search_query.trim().to_lowercase();
+        self.snapshot
+            .iter()
+            .flat_map(|snapshot| &snapshot.issues)
+            .filter(move |issue| {
+                self.status_filter
+                    .as_ref()
+                    .is_none_or(|status| issue.state.name == *status)
+                    && (query.is_empty()
+                        || issue.title.to_lowercase().contains(&query)
+                        || issue.identifier.to_lowercase().contains(&query))
+            })
+    }
+
+    pub fn statuses(&self) -> Vec<String> {
+        self.snapshot
+            .iter()
+            .flat_map(|snapshot| &snapshot.issues)
+            .map(|issue| issue.state.name.clone())
+            .chain(self.status_filter.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn filter_status(&mut self, status: Option<String>) {
+        let selected = self.issue().map(|issue| issue.id.clone());
+        self.status_filter = status;
+        self.restore_selection(selected.as_deref());
+    }
+
+    pub fn search(&mut self, query: String) {
+        let selected = self.issue().map(|issue| issue.id.clone());
+        self.search_query = query;
+        self.restore_selection(selected.as_deref());
+    }
+
+    pub fn update_issue(&mut self, updated: Issue) {
+        let selected = self.issue().map(|issue| issue.id.clone());
+        if let Some(issue) = self.snapshot.as_mut().and_then(|snapshot| {
+            snapshot
+                .issues
+                .iter_mut()
+                .find(|issue| issue.id == updated.id)
+        }) {
+            *issue = updated;
+        }
+        self.restore_selection(selected.as_deref());
+    }
+
+    fn restore_selection(&mut self, id: Option<&str>) {
+        let selected = self
+            .issues()
+            .position(|issue| Some(issue.id.as_str()) == id)
+            .unwrap_or(0);
+        self.selected = selected;
     }
 
     pub fn busy(&self) -> bool {
@@ -112,10 +176,7 @@ impl Linear {
     }
 
     pub fn select(&mut self, step: isize) {
-        let count = self
-            .snapshot
-            .as_ref()
-            .map_or(0, |snapshot| snapshot.issues.len());
+        let count = self.issues().count();
         if count > 0 {
             self.selected = self.selected.saturating_add_signed(step).min(count - 1);
         }
@@ -349,17 +410,13 @@ impl Linear {
                             self.closed = result.closed;
                             let snapshot = result.snapshot;
                             let selected = self.issue().map(|issue| issue.id.clone());
-                            self.selected = selected
-                                .and_then(|id| {
-                                    snapshot.issues.iter().position(|issue| issue.id == id)
-                                })
-                                .unwrap_or(0);
                             self.status = format!(
                                 "Linear: {} — {} assigned issues",
                                 result.workspace.name,
                                 snapshot.issues.len()
                             );
                             self.snapshot = Some(snapshot);
+                            self.restore_selection(selected.as_deref());
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -404,6 +461,73 @@ impl Drop for Linear {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn combined_filters_preserve_selection_across_refresh_and_issue_edits() {
+        let mut snapshot = Snapshot {
+            viewer: "Test".into(),
+            issues: (1..=3)
+                .map(|id| Issue {
+                    id: id.to_string(),
+                    identifier: format!("APP-{id}"),
+                    title: format!("Ticket {id}"),
+                    description: None,
+                    url: String::new(),
+                    branch_name: None,
+                    state: ::linear::Named {
+                        name: if id == 1 { "Todo" } else { "Started" }.into(),
+                    },
+                    team: ::linear::Named { name: "App".into() },
+                })
+                .collect(),
+        };
+        let mut state = Linear::new(
+            None,
+            vec![],
+            Store::new(sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap()),
+            Some(snapshot.clone()),
+            None,
+        );
+        state.search("  tIcKeT  ".into());
+        state.select(1);
+        state.filter_status(Some("Started".into()));
+        assert_eq!(state.issues().count(), 2);
+        assert_eq!(state.statuses(), ["Started", "Todo"]);
+        assert_eq!(state.issue().unwrap().identifier, "APP-2");
+        snapshot.issues.reverse();
+        let (sender, receiver) = mpsc::channel();
+        state.receiver = Some(receiver);
+        sender
+            .send(Update::Done(Ok(SyncResult {
+                snapshot,
+                closed: vec![],
+                workspace: ::linear::Workspace {
+                    id: "test".into(),
+                    name: "Test".into(),
+                },
+            })))
+            .unwrap();
+        state.poll();
+        assert_eq!(state.issue().unwrap().identifier, "APP-2");
+        let mut updated = state.issue().unwrap().clone();
+        updated.title = "Renamed".into();
+        state.update_issue(updated);
+        assert_eq!(state.issue().unwrap().identifier, "APP-3");
+        state.search("app-2".into());
+        assert_eq!(state.issue().unwrap().title, "Renamed");
+        let mut updated = state.issue().unwrap().clone();
+        updated.state.name = "Todo".into();
+        state.update_issue(updated);
+        assert!(state.issue().is_none());
+        state.filter_status(None);
+        assert_eq!(state.issue().unwrap().identifier, "APP-2");
+        state.search("missing".into());
+        state.select(1);
+        assert!(state.issue().is_none());
+        state.search(String::new());
+        assert_eq!(state.issues().count(), 3);
+    }
+
     #[tokio::test]
     async fn workspace_picker_waits_for_edit_completion_without_losing_the_request() {
         let mut state = Linear::new(

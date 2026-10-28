@@ -2,6 +2,7 @@ mod agent_session;
 mod app;
 mod browser;
 mod cli;
+mod clipboard;
 mod codex_session;
 mod config;
 mod host;
