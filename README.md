@@ -15,3 +15,13 @@ mentat
 mentat --cwd /path/to/repo
 ```
 
+From the sidebar, select a ticket and use these workspace shortcuts:
+
+| Shortcut | Action |
+| --- | --- |
+| `t` | Open the internal shell |
+| `Shift-T` | Open the workspace in Ghostty (macOS) |
+| `Shift-F` | Open the workspace in Finder (macOS) |
+
+Mentat creates the ticket's workspace if it does not exist. Press `Ctrl-G` to return to the sidebar from a terminal pane.
+

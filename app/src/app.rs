@@ -24,7 +24,7 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use std::{
     collections::HashMap,
     io::{self, BufWriter, IsTerminal, Write},
-    process::Child,
+    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -50,6 +50,13 @@ struct StatusPicker {
     selected: usize,
 }
 
+struct PendingOpen {
+    ticket_id: String,
+    child: Child,
+    success: String,
+    failure: String,
+}
+
 impl MouseOutcome {
     fn redraw() -> Self {
         Self {
@@ -72,7 +79,7 @@ struct App {
     selection: Option<ui::TerminalSelection>,
     overview_selection: Option<ui::TextSelection>,
     clipboard: Option<String>,
-    link_openers: Vec<(String, Child)>,
+    openers: Vec<PendingOpen>,
     pushes: HashMap<String, crate::workspace::Push>,
     help: bool,
     status: bool,
@@ -119,7 +126,7 @@ pub fn run(config: Config) -> Result<()> {
         selection: None,
         overview_selection: None,
         clipboard: None,
-        link_openers: Vec::new(),
+        openers: Vec::new(),
         pushes: HashMap::new(),
         help: false,
         status: false,
@@ -331,7 +338,7 @@ impl App {
         {
             self.selection_changed();
         }
-        redraw |= self.poll_link_openers();
+        redraw |= self.poll_openers();
         redraw |= self.poll_pushes();
         redraw |= self.poll_linear()?;
         redraw |= self.poll_sessions()?;
@@ -425,22 +432,26 @@ impl App {
         redraw
     }
 
-    /// Report the outcome of the external URL handler once it exits.
-    fn poll_link_openers(&mut self) -> bool {
+    /// Report the outcome of an external application launcher once it exits.
+    fn poll_openers(&mut self) -> bool {
         let mut redraw = false;
-        self.link_openers.retain_mut(|(id, child)| match child.try_wait() {
-            Ok(None) => true,
-            result => {
-                let message = match result {
-                    Ok(Some(status)) if status.success() => "Opened issue in Linear.".into(),
-                    _ => "Could not open Linear. Check your system's default browser or URL handler."
-                        .into(),
-                };
-                record_event(&mut self.activity, id.clone(), message);
-                redraw = true;
-                false
-            }
-        });
+        self.openers
+            .retain_mut(|opener| match opener.child.try_wait() {
+                Ok(None) => true,
+                result => {
+                    let message = match result {
+                        Ok(Some(status)) if status.success() => &opener.success,
+                        _ => &opener.failure,
+                    };
+                    record_event(
+                        &mut self.activity,
+                        opener.ticket_id.clone(),
+                        message.clone(),
+                    );
+                    redraw = true;
+                    false
+                }
+            });
         redraw
     }
 
@@ -807,8 +818,8 @@ impl App {
                         });
                     if let Some(text) = text {
                         self.copy(host, text)?;
+                        return Ok(false);
                     }
-                    return Ok(false);
                 }
                 KeyCode::Char('v') => {
                     let text = crate::clipboard::paste()
@@ -993,6 +1004,8 @@ impl App {
             }
 
             KeyCode::Char('o') => self.open_in_linear()?,
+            KeyCode::Char('T') => self.open_workspace("Ghostty")?,
+            KeyCode::Char('F') => self.open_workspace("Finder")?,
             KeyCode::Char('b') => self.create_bookmark()?,
             KeyCode::Char('d') => self.describe_ticket()?,
             KeyCode::Char('p') => self.push_ticket()?,
@@ -1190,6 +1203,38 @@ impl App {
         Ok(())
     }
 
+    fn open_workspace(&mut self, application: &str) -> Result<()> {
+        anyhow::ensure!(cfg!(target_os = "macos"), "This shortcut requires macOS");
+        let issue = self
+            .linear
+            .issue()
+            .cloned()
+            .context("Select a Linear ticket first")?;
+        self.ensure_session(&issue)?;
+        let directory = &self.sessions[&issue.id].config.cwd;
+        let child = Command::new("open")
+            .args(["-a", application])
+            .arg(directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("Cannot open workspace in {application}"))?;
+        self.openers.push(PendingOpen {
+            ticket_id: issue.id.clone(),
+            child,
+            success: format!("Opened in {application}."),
+            failure: format!(
+                "Could not open {application}. Check that {application} is installed."
+            ),
+        });
+        self.record(
+            issue.id,
+            format!("Opening {} in {application}…", issue.identifier),
+        );
+        Ok(())
+    }
+
     /// Hand the selected ticket to the system browser, reported once it exits.
     fn open_in_linear(&mut self) -> Result<()> {
         let issue = self
@@ -1208,7 +1253,13 @@ impl App {
         })?;
         let id = issue.id.clone();
         let message = format!("Opening {} in Linear…", issue.identifier);
-        self.link_openers.push((id.clone(), child));
+        self.openers.push(PendingOpen {
+            ticket_id: id.clone(),
+            child,
+            success: "Opened issue in Linear.".into(),
+            failure: "Could not open Linear. Check your system's default browser or URL handler."
+                .into(),
+        });
         self.record(id, message);
         Ok(())
     }

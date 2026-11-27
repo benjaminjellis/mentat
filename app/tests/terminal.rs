@@ -374,6 +374,50 @@ fn opens_selected_linear_issue_and_reports_opener_errors() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
+fn workspace_shortcuts_open_the_selected_directory_and_report_errors() {
+    let temp = fixture();
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let opener = bin.join("open");
+    fs::write(
+        &opener,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$OPENED_PATH\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&opener, fs::Permissions::from_mode(0o700)).unwrap();
+    let capture = temp.path().join("opened-path");
+    let mut host = start_with_env(
+        &temp,
+        &[
+            format!("PATH={}:{}", bin.display(), std::env::var("PATH").unwrap()).into(),
+            format!("OPENED_PATH={}", capture.display()).into(),
+        ],
+    );
+    wait_for(&host, "TEST-1");
+    host.write(b"jT").unwrap();
+    wait_for(&host, "Opened in Ghostty.");
+    let directory = temp.path().join("checkouts/TEST-2");
+    assert!(directory.is_dir());
+    assert_eq!(
+        fs::read_to_string(&capture).unwrap(),
+        format!("-a\nGhostty\n{}\n", directory.display())
+    );
+    host.write(b"F").unwrap();
+    wait_for(&host, "Opened in Finder.");
+    assert_eq!(
+        fs::read_to_string(&capture).unwrap(),
+        format!("-a\nFinder\n{}\n", directory.display())
+    );
+    assert!(!temp.path().join("checkouts/TEST-1").exists());
+
+    fs::write(&opener, "#!/bin/sh\nexit 1\n").unwrap();
+    host.write(b"F").unwrap();
+    wait_for(&host, "Could not open Finder.");
+    quit(&mut host, false);
+}
+
+#[test]
 fn describe_shortcut_uses_the_selected_linear_ticket_workspace() {
     let temp = fixture();
     let mut host = start(&temp);
@@ -701,6 +745,10 @@ fn dragging_output_copies_only_the_main_pane_and_preserves_paste() {
     fs::write(&clipboard_path, "Ticket 1\nlpha\nbet").unwrap();
     writer.write_all(b"\r\x16").unwrap();
     wait(&|_| fs::read(&capture).unwrap_or_default() == b"\x1b[200~Ticket 1\nlpha\nbet\x1b[201~");
+    writer.write_all(b"\x03").unwrap();
+    wait(&|_| {
+        fs::read(&capture).unwrap_or_default() == b"\x1b[200~Ticket 1\nlpha\nbet\x1b[201~\x03"
+    });
     writer.write_all(b"\x07q").unwrap();
     wait(&|bytes| screen_contains(bytes, "Force quit"));
     writer.write_all(b"f").unwrap();
@@ -1028,10 +1076,10 @@ fn ticket_paste_only_seeds_new_agent_conversations() {
     host.write(b"\x7f\x1b[127u\x1b[13;2uAFTER\r").unwrap();
     expected.extend_from_slice(b"\x7f\x7f\x1b[13;2uAFTER\r");
     expect_input(&expected);
-    // A focused PTY owns pane and manager keys; Ctrl-C remains a copy shortcut.
+    // A focused PTY owns pane and manager keys, including Ctrl-C without a selection.
     host.write(b"\x08\x0a\x0b\x0c\x1b[104;5u\x1b[108;5uqbes?\x03")
         .unwrap();
-    expected.extend_from_slice(b"\x08\x0a\x0b\x0c\x08\x0cqbes?");
+    expected.extend_from_slice(b"\x08\x0a\x0b\x0c\x08\x0cqbes?\x03");
     host.write(b"\x09\x1b[105;5u").unwrap();
     expected.extend_from_slice(b"\x09\x09");
     expect_input(&expected);
